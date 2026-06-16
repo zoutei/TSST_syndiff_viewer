@@ -7,11 +7,25 @@ import pytest
 
 from review.ds9 import (
     Ds9Controller,
+    _LoadJob,
     format_fits_display_path,
     launch_ds9,
     _build_xpa_cmd,
     _xpa_accepts_process_flag,
 )
+
+
+def _load_job(**kwargs) -> _LoadJob:
+    defaults = {
+        "fits_path": "/tmp/test.fits",
+        "display_path": "test.fits",
+        "regions": None,
+        "is_diff": False,
+        "label": "sci",
+        "open_mode": "xpa",
+    }
+    defaults.update(kwargs)
+    return _LoadJob(**defaults)
 
 
 def _fits_stub(tmp_path: Path) -> Path:
@@ -85,10 +99,9 @@ def test_diff_uses_scale_limits(tmp_path):
 
     with patch.object(ctrl, "_xpa_set", side_effect=fake_run):
         ctrl._load_via_xpa(
-            __import__("review.ds9", fromlist=["_LoadJob"])._LoadJob(
+            _load_job(
                 fits_path=str(fits),
                 display_path="test.fits",
-                regions=None,
                 is_diff=True,
                 label="diff",
             )
@@ -110,11 +123,9 @@ def test_nondiff_uses_percentile_scale(tmp_path):
 
     with patch.object(ctrl, "_xpa_set", side_effect=fake_run):
         ctrl._load_via_xpa(
-            __import__("review.ds9", fromlist=["_LoadJob"])._LoadJob(
+            _load_job(
                 fits_path=str(fits),
                 display_path="test.fits",
-                regions=None,
-                is_diff=False,
                 label="sci",
             )
         )
@@ -134,11 +145,10 @@ def test_load_via_xpa_uses_fits_not_file(tmp_path):
 
     with patch.object(ctrl, "_xpa_set", side_effect=fake_run):
         ctrl._load_via_xpa(
-            __import__("review.ds9", fromlist=["_LoadJob"])._LoadJob(
+            _load_job(
                 fits_path=str(fits),
                 display_path="test.fits",
                 regions="/tmp/mask.reg",
-                is_diff=False,
                 label="sci",
             )
         )
@@ -156,11 +166,9 @@ def test_execute_load_uses_xpa_on_darwin(tmp_path):
         with patch.object(ctrl, "is_running", return_value=True):
             with patch.object(ctrl, "_load_via_xpa") as load:
                 ctrl._execute_load(
-                    __import__("review.ds9", fromlist=["_LoadJob"])._LoadJob(
+                    _load_job(
                         fits_path=str(fits),
                         display_path="test.fits",
-                        regions=None,
-                        is_diff=False,
                         label="sci",
                     )
                 )
@@ -199,3 +207,95 @@ def test_enqueue_message_includes_display_path(tmp_path):
 def test_launch_ds9_rejects_missing_path():
     res = launch_ds9([Path("/nonexistent/file.fits")])
     assert not res.ok
+
+
+def test_load_via_open_uses_macos_open(tmp_path):
+    fits = _fits_stub(tmp_path)
+    ctrl = Ds9Controller()
+
+    with patch.object(sys, "platform", "darwin"):
+        with patch("review.ds9.subprocess.Popen") as popen:
+            cmd = ctrl._load_via_open(_load_job(fits_path=str(fits)))
+
+    assert cmd == ["open", "-a", "SAOImageDS9", str(fits)]
+    popen.assert_called_once()
+    assert popen.call_args[0][0] == cmd
+
+
+def test_load_via_open_requires_darwin(tmp_path):
+    fits = _fits_stub(tmp_path)
+    ctrl = Ds9Controller()
+
+    with patch.object(sys, "platform", "linux"):
+        with pytest.raises(RuntimeError, match="darwin"):
+            ctrl._load_via_open(_load_job(fits_path=str(fits)))
+
+
+def test_load_via_cli_diff_scale_and_regions(tmp_path):
+    fits = _fits_stub(tmp_path)
+    ctrl = Ds9Controller(diff_scale=(-10.0, 10.0))
+
+    with patch("review.ds9.subprocess.Popen") as popen:
+        with patch.object(ctrl, "_resolve_ds9_cli_exe", return_value="/usr/bin/ds9"):
+            cmd = ctrl._load_via_cli(
+                _load_job(
+                    fits_path=str(fits),
+                    regions="/tmp/mask.reg",
+                    is_diff=True,
+                    label="diff",
+                )
+            )
+
+    assert cmd == [
+        "/usr/bin/ds9",
+        "-scale",
+        "limits",
+        "-10.0",
+        "10.0",
+        "-regions",
+        "load",
+        "/tmp/mask.reg",
+        str(fits),
+    ]
+    popen.assert_called_once()
+
+
+def test_load_via_cli_percentile_scale(tmp_path):
+    fits = _fits_stub(tmp_path)
+    ctrl = Ds9Controller(percentile_scale=90)
+
+    with patch("review.ds9.subprocess.Popen"):
+        with patch.object(ctrl, "_resolve_ds9_cli_exe", return_value="/usr/bin/ds9"):
+            cmd = ctrl._load_via_cli(_load_job(fits_path=str(fits)))
+
+    assert cmd == ["/usr/bin/ds9", "-scale", "mode", "90", str(fits)]
+
+
+def test_execute_load_open_mode_skips_xpa(tmp_path):
+    fits = _fits_stub(tmp_path)
+    ctrl = Ds9Controller()
+
+    with patch.object(ctrl, "_load_via_open", return_value=["open", "-a", "SAOImageDS9", str(fits)]) as open_load:
+        with patch.object(ctrl, "_load_via_xpa") as xpa_load:
+            ctrl._execute_load(_load_job(fits_path=str(fits), open_mode="open"))
+
+    open_load.assert_called_once()
+    xpa_load.assert_not_called()
+
+
+def test_enqueue_snapshots_open_mode(tmp_path):
+    fits = _fits_stub(tmp_path)
+    ctrl = Ds9Controller(open_mode="cli")
+    captured: list[_LoadJob] = []
+
+    def capture(job: _LoadJob) -> None:
+        captured.append(job)
+
+    with patch.object(ctrl, "_execute_load", side_effect=capture):
+        ctrl.open_mode = "open"
+        res = ctrl.enqueue_load(fits, label="sci")
+        ctrl._queue.join()
+
+    assert res.ok
+    assert "(macOS open)" in res.message
+    assert captured[0].open_mode == "open"

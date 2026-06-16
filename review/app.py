@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 from typing import Any
 
 import numpy as np
@@ -124,6 +125,22 @@ def _ds9_button_grid(buttons: list[tuple[str, str]]) -> html.Div:
     )
 
 
+def _ds9_open_mode_options() -> list[dict[str, str]]:
+    options: list[dict[str, str]] = [
+        {"label": "XPA (scale + regions)", "value": "xpa"},
+        {"label": "ds9 command line", "value": "cli"},
+    ]
+    if sys.platform == "darwin":
+        options.insert(1, {"label": "macOS open -a", "value": "open"})
+    return options
+
+
+def _default_ds9_open_mode(cfg: ReviewConfig) -> str:
+    mode = cfg.ds9_open_mode
+    allowed = {o["value"] for o in _ds9_open_mode_options()}
+    return mode if mode in allowed else "xpa"
+
+
 def _list_event_labels(cfg: ReviewConfig) -> list[str]:
     events = list_events(cfg.source_mount_expanded) or list_events(cfg.data_mount_expanded)
     if not events:
@@ -168,6 +185,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
         ds9_xpa_dir=cfg.ds9_xpa_dir,
         diff_scale=cfg.ds9_diff_scale,
         percentile_scale=cfg.ds9_percentile_scale,
+        open_mode=_default_ds9_open_mode(cfg),
     )
     mount_ok, mount_msg = is_healthy(
         cfg.data_mount_expanded,
@@ -448,13 +466,27 @@ def create_app(cfg: ReviewConfig) -> Dash:
                             ),
                         ],
                     ),
+                    html.Div(
+                        [
+                            html.Label("DS9 open"),
+                            dcc.Dropdown(
+                                id="ds9-open-mode",
+                                options=_ds9_open_mode_options(),
+                                value=_default_ds9_open_mode(cfg),
+                                clearable=False,
+                                style={"width": "220px"},
+                            ),
+                        ],
+                        style={"marginLeft": "auto", "alignSelf": "end"},
+                    ),
                 ],
                 style={
-                    "display": "grid",
-                    "gridTemplateColumns": "repeat(auto-fit, minmax(180px, 1fr))",
+                    "display": "flex",
+                    "flexWrap": "wrap",
                     "gap": "10px",
                     "padding": "12px",
                     "borderTop": "1px solid #ddd",
+                    "alignItems": "end",
                 },
             ),
             dcc.Store(id="event-index-store"),
@@ -1076,15 +1108,19 @@ def create_app(cfg: ReviewConfig) -> Dash:
         [Input(btn_id, "n_clicks") for btn_id in _DS9_BTN_IDS],
         State("event-index-store", "data"),
         State("selected-epoch", "data"),
+        State("ds9-open-mode", "value"),
         prevent_initial_call=True,
     )
     def ds9_buttons(*args):
         n_clicks = args[: len(_DS9_BTN_IDS)]
         store = args[len(_DS9_BTN_IDS)]
         epoch_idx = args[len(_DS9_BTN_IDS) + 1]
+        open_mode = args[len(_DS9_BTN_IDS) + 2]
 
         if not ctx.triggered_id:
             return no_update
+
+        ds9.open_mode = open_mode if open_mode in ("xpa", "open", "cli") else "xpa"
 
         btn = ctx.triggered_id
         regions = store.get("regions_path") if store else None

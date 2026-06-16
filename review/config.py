@@ -22,6 +22,7 @@ class ReviewConfig:
     sync_on_start: bool = True
     ds9_path: str = "SAOImageDS9"
     ds9_xpa_dir: str | None = None
+    ds9_open_mode: str = "xpa"
     ds9_diff_scale_min: float = -10.0
     ds9_diff_scale_max: float = 10.0
     ds9_percentile_scale: float = 90.0

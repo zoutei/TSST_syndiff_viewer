@@ -7,6 +7,7 @@ sync_on_start: true
 
 ds9_path: SAOImageDS9   # macOS: open -a SAOImageDS9
 # ds9_xpa_dir: /Applications/SAOImageDS9.app/Contents/MacOS
+ds9_open_mode: xpa   # xpa | open | cli
 ds9_diff_scale_min: -10
 ds9_diff_scale_max: 10
 ds9_percentile_scale: 90

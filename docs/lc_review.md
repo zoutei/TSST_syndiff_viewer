@@ -30,6 +30,18 @@ The review tool uses a **single DS9 instance** on macOS:
 3. **Load FITS** via XPA: `xpaset -p ds9 frame new`, `xpaset -p ds9 fits <path>`, then scale and `region load` as needed.
 4. Commands are **queued** so rapid clicks load sequentially. Status shows the workspace-relative path, e.g. `Queued kernel_fit/ffi.fits`.
 
+### Open mode (bottom bar)
+
+Use the **DS9 open** dropdown in the bottom control bar to choose how FITS files are sent to DS9:
+
+| Mode | Behavior |
+|------|----------|
+| **XPA** (default) | Full control via `xpaset`: new frame, scale limits/mode, and `targets.reg` overlay |
+| **macOS open -a** | `open -a SAOImageDS9 <fits>` — opens the file in DS9 without scale or region control |
+| **ds9 command line** | `ds9 -scale … [-regions load …] <fits>` — scale and regions via CLI flags |
+
+Set the default in `review.yaml` with `ds9_open_mode: xpa` (or `open`, `cli`).
+
 ### Sidebar buttons
 
 **Selected FFI** (per epoch): Diff, FFI, Template, Conv Template, Background, Mask.

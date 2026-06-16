@@ -11,11 +11,18 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
 from review.paths_resolve import resolve_fits_path
 
 log = logging.getLogger(__name__)
+
+Ds9OpenMode = Literal["xpa", "open", "cli"]
+DS9_OPEN_MODE_LABELS: dict[Ds9OpenMode, str] = {
+    "xpa": "XPA",
+    "open": "macOS open",
+    "cli": "ds9 CLI",
+}
 
 DEFAULT_DS9_APP = "SAOImageDS9"
 DEFAULT_XPA_DIR = Path("/Applications/SAOImageDS9.app/Contents/MacOS")
@@ -39,6 +46,7 @@ class _LoadJob:
     regions: str | None
     is_diff: bool
     label: str
+    open_mode: Ds9OpenMode
 
 
 def format_fits_display_path(path: str | Path) -> str:
@@ -127,6 +135,12 @@ def _build_xpa_set_cmd(tool: str, access_point: str, *args: str) -> list[str]:
     return [tool, "-p", access_point, *args]
 
 
+def _normalize_open_mode(mode: str | Ds9OpenMode) -> Ds9OpenMode:
+    if mode in ("xpa", "open", "cli"):
+        return mode  # type: ignore[return-value]
+    return "xpa"
+
+
 class Ds9Controller:
     """Singleton-style DS9 launcher: one app instance, queued XPA loads."""
 
@@ -139,9 +153,11 @@ class Ds9Controller:
         percentile_scale: float = DEFAULT_PERCENTILE_SCALE,
         launch_poll_s: float = 0.5,
         launch_retries: int = 40,
+        open_mode: Ds9OpenMode | str = "xpa",
     ) -> None:
         self.ds9_path = ds9_path
         self.ds9_xpa_dir = ds9_xpa_dir
+        self.open_mode: Ds9OpenMode = _normalize_open_mode(open_mode)
         self.diff_scale = diff_scale
         self.percentile_scale = percentile_scale
         self.launch_poll_s = launch_poll_s
@@ -178,6 +194,20 @@ class Ds9Controller:
 
     def is_running(self) -> bool:
         return self._refresh_xpa_target()
+
+    def _resolve_ds9_app_name(self) -> str:
+        app = self.ds9_path
+        if app in ("ds9", DEFAULT_DS9_APP, "open"):
+            return DEFAULT_DS9_APP
+        return app
+
+    def _resolve_ds9_cli_exe(self) -> str:
+        exe = self.ds9_path
+        if exe in (DEFAULT_DS9_APP, "open"):
+            exe = shutil.which("ds9") or str(DEFAULT_XPA_DIR / "ds9")
+        elif exe == "ds9":
+            exe = shutil.which("ds9") or str(DEFAULT_XPA_DIR / "ds9")
+        return exe
 
     def _launch_ds9_app(self) -> None:
         if sys.platform == "darwin":
@@ -237,6 +267,7 @@ class Ds9Controller:
             self._pending += 1
             pending = self._pending
 
+        mode = self.open_mode
         self._queue.put(
             _LoadJob(
                 fits_path=str(resolved),
@@ -244,9 +275,12 @@ class Ds9Controller:
                 regions=reg_path,
                 is_diff=is_diff,
                 label=label,
+                open_mode=mode,
             )
         )
         msg = f"Queued {display}"
+        if mode != "xpa":
+            msg += f" ({DS9_OPEN_MODE_LABELS[mode]})"
         if pending > 1:
             msg += f" ({pending} pending)"
         return Ds9LaunchResult(True, msg, ["enqueue", label, str(resolved)])
@@ -294,10 +328,47 @@ class Ds9Controller:
                 err = (result.stderr or result.stdout or "").strip()
                 raise RuntimeError(f"xpaset {desc} failed: {err or 'unknown error'}")
 
+    def _load_via_open(self, job: _LoadJob) -> list[str]:
+        if sys.platform != "darwin":
+            raise RuntimeError("macOS open mode requires darwin")
+        app = self._resolve_ds9_app_name()
+        cmd = ["open", "-a", app, job.fits_path]
+        subprocess.Popen(  # noqa: S603
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return cmd
+
+    def _load_via_cli(self, job: _LoadJob) -> list[str]:
+        exe = self._resolve_ds9_cli_exe()
+        cmd: list[str] = [exe]
+        if job.is_diff:
+            lo, hi = self.diff_scale
+            cmd.extend(["-scale", "limits", str(lo), str(hi)])
+        else:
+            cmd.extend(["-scale", "mode", str(self.percentile_scale)])
+        if job.regions:
+            cmd.extend(["-regions", "load", job.regions])
+        cmd.append(job.fits_path)
+        subprocess.Popen(  # noqa: S603
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return cmd
+
     def _execute_load(self, job: _LoadJob) -> None:
-        if not self.is_running():
-            self.ensure_running()
-        self._load_via_xpa(job)
+        if job.open_mode == "open":
+            self._load_via_open(job)
+        elif job.open_mode == "cli":
+            self._load_via_cli(job)
+        else:
+            if not self.is_running():
+                self.ensure_running()
+            self._load_via_xpa(job)
         with self._lock:
             self._last_message = f"Loaded {job.display_path}"
 
