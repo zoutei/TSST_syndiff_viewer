@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -20,9 +21,19 @@ from review.support.paths import (
     TARGETS_DS9_REGION_BASENAME,
     master_root,
 )
+from review.support.templates import (
+    find_template_by_offset,
+    lookup_convolved_template,
+    parse_crop_bounds_from_targets_reg,
+    resolve_template_dir,
+)
 
 from .paths_resolve import resolve_fits_path
 from .pipeline_labels import PipelineLabels, list_lightcurve_options, parse_diff_config
+
+log = logging.getLogger(__name__)
+
+CLUSTER_TEMPLATE_JOB_BASENAME = "cluster_template_job.json"
 
 
 @dataclass
@@ -35,6 +46,9 @@ class EventIndex:
     lc_name: str
     lc_dir: str
     fits_event_dir: Path
+    crop_bounds: dict | None = None
+    template_dir: Path | None = None
+    conv_templates_dir: Path | None = None
 
     @classmethod
     def load(
@@ -50,6 +64,7 @@ class EventIndex:
         event_path = Path(event_dir).resolve()
         fits_path = Path(fits_event_dir).resolve() if fits_event_dir else event_path
         ws = event_path / workspace_subdir
+        fits_ws = fits_path / workspace_subdir
         labels = parse_diff_config(ws / "diff_config.yaml")
         resolved_lc_dir = lc_dir or labels.lc_dir
         if lc_filename is None:
@@ -58,6 +73,17 @@ class EventIndex:
         lc_path = ws / resolved_lc_dir / lc_filename
         lc_df = _read_lightcurve(lc_path)
         manifest_df = load_frame_manifest(str(event_path))
+
+        crop_bounds = parse_crop_bounds_from_targets_reg(ws)
+        template_dir = resolve_template_dir(fits_ws)
+        conv_templates_dir = (
+            fits_ws / labels.conv_template_label if labels.conv_template_label else None
+        )
+
+        cluster_job_path = event_path / CLUSTER_TEMPLATE_JOB_BASENAME
+        if not cluster_job_path.is_file():
+            log.debug("No %s under %s", CLUSTER_TEMPLATE_JOB_BASENAME, event_path)
+
         epochs = _build_epoch_table(
             metadata_event_path=event_path,
             fits_event_path=fits_path,
@@ -65,6 +91,8 @@ class EventIndex:
             labels=labels,
             lc_df=lc_df,
             manifest_df=manifest_df,
+            template_dir=template_dir,
+            conv_templates_dir=conv_templates_dir,
         )
         return cls(
             event_dir=event_path,
@@ -75,6 +103,9 @@ class EventIndex:
             lc_name=lc_name,
             lc_dir=resolved_lc_dir,
             fits_event_dir=fits_path,
+            crop_bounds=crop_bounds,
+            template_dir=template_dir,
+            conv_templates_dir=conv_templates_dir,
         )
 
     @property
@@ -228,26 +259,35 @@ class _MasterIndex:
 
 @dataclass
 class _TemplatePathCache:
-    """Cache template lookups per group_id and per product_id."""
+    """Cache offset-based template lookups per (group_dx, group_dy)."""
 
-    ws: Path
+    template_dir: Path | None
     labels: PipelineLabels
-    _by_group: dict[int, Path | None] = field(default_factory=dict)
-    _by_product: dict[str, Path | None] = field(default_factory=dict)
+    _by_offset: dict[tuple[float, float], Path | None] = field(default_factory=dict)
+    _by_group_yaml: dict[int, Path | None] = field(default_factory=dict)
 
-    def lookup(self, group_id: int | None, product_id: str | None) -> Path | None:
-        if group_id is not None:
-            if group_id not in self._by_group:
-                self._by_group[group_id] = _lookup_group_template(self.ws, self.labels, group_id)
-            hit = self._by_group[group_id]
+    def lookup(
+        self,
+        group_id: int | None,
+        group_dx: float | None,
+        group_dy: float | None,
+    ) -> Path | None:
+        if group_dx is not None and group_dy is not None and self.template_dir is not None:
+            key = (round(float(group_dx), 6), round(float(group_dy), 6))
+            if key not in self._by_offset:
+                self._by_offset[key] = find_template_by_offset(
+                    self.template_dir, dx=key[0], dy=key[1]
+                )
+            hit = self._by_offset[key]
             if hit is not None:
                 return hit
-        if self.labels.template_dir and product_id:
-            if product_id not in self._by_product:
-                self._by_product[product_id] = _lookup_product_template(
-                    self.labels.template_dir, product_id
+
+        if group_id is not None:
+            if group_id not in self._by_group_yaml:
+                self._by_group_yaml[group_id] = _lookup_yaml_template_path(
+                    self.labels, group_id, self.template_dir
                 )
-            return self._by_product[product_id]
+            return self._by_group_yaml[group_id]
         return None
 
 
@@ -279,6 +319,20 @@ def _read_lightcurve(path: Path) -> pd.DataFrame:
     return df.loc[ok].reset_index(drop=True)
 
 
+def _float_or_none(value: Any) -> float | None:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _build_epoch_table(
     *,
     metadata_event_path: Path,
@@ -287,12 +341,14 @@ def _build_epoch_table(
     labels: PipelineLabels,
     lc_df: pd.DataFrame,
     manifest_df: pd.DataFrame,
+    template_dir: Path | None,
+    conv_templates_dir: Path | None,
 ) -> pd.DataFrame:
     meta_ws = metadata_event_path / workspace_subdir
     fits_ws = fits_event_path / workspace_subdir
     master = Path(master_root(str(fits_event_path), workspace_subdir))
     master_index = _MasterIndex.build(master, fits_ws)
-    template_cache = _TemplatePathCache(ws=fits_ws, labels=labels)
+    template_cache = _TemplatePathCache(template_dir=template_dir, labels=labels)
 
     regions = meta_ws / TARGETS_DS9_REGION_BASENAME
     mask = fits_ws / "shared_mask.fits"
@@ -321,6 +377,9 @@ def _build_epoch_table(
         except (TypeError, ValueError):
             group_id = None
 
+        group_dx = _float_or_none(man.get("group_dx"))
+        group_dy = _float_or_none(man.get("group_dy"))
+
         flux = lc_row.get("flux")
         eflux = lc_row.get("eflux")
         btjd = lc_row.get("btjd")
@@ -332,8 +391,8 @@ def _build_epoch_table(
 
         diff_path = _resolve_master_or_workspace(master_index, fits_ws, pid, labels.diff_label)
         conv_template_path = (
-            _resolve_master_or_workspace(master_index, fits_ws, pid, labels.conv_template_label)
-            if labels.conv_template_label
+            lookup_convolved_template(conv_templates_dir, group_dx, group_dy)
+            if conv_templates_dir is not None and group_dx is not None and group_dy is not None
             else None
         )
         conv_path = (
@@ -349,7 +408,7 @@ def _build_epoch_table(
 
         sci_basename = str(man.get("filename") or "")
         sci_path = _resolve_sci_path(master_index, fits_ws, sci_basename, pid)
-        template_path = template_cache.lookup(group_id, pid)
+        template_path = template_cache.lookup(group_id, group_dx, group_dy)
 
         hotpants_ok = man.get(hotpants_ok_col)
         if pd.isna(hotpants_ok):
@@ -366,6 +425,8 @@ def _build_epoch_table(
                 "snr": snr,
                 "product_id": pid,
                 "group_id": group_id,
+                "group_dx": group_dx,
+                "group_dy": group_dy,
                 "filename": sci_basename,
                 "diff_path": str(diff_path) if diff_path else None,
                 "conv_path": str(conv_path) if conv_path else None,
@@ -418,25 +479,23 @@ def _resolve_sci_path(
     return None
 
 
-def _lookup_group_template(ws: Path, labels: PipelineLabels, group_id: int) -> Path | None:
+def _lookup_yaml_template_path(
+    labels: PipelineLabels,
+    group_id: int,
+    template_dir: Path | None,
+) -> Path | None:
     key = str(group_id)
-    if key in labels.template_paths:
-        p = Path(labels.template_paths[key])
-        if p.is_file():
-            return p
-    group_dir = ws / "templates" / f"group_{group_id}"
-    if group_dir.is_dir():
-        for entry in sorted(group_dir.glob("*.fits")):
-            return entry
-    return None
-
-
-def _lookup_product_template(template_dir: str, product_id: str) -> Path | None:
-    tdir = Path(template_dir)
-    if tdir.is_dir():
-        for entry in tdir.glob(f"{product_id}*.fits"):
-            return entry
-    return None
+    if key not in labels.template_paths:
+        return None
+    p = Path(labels.template_paths[key])
+    if not p.is_file():
+        return None
+    if template_dir is not None:
+        try:
+            p.resolve().relative_to(template_dir.resolve())
+        except ValueError:
+            return None
+    return p
 
 
 def resolve_labeled_epoch_path(

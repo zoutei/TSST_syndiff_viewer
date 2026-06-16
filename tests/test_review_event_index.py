@@ -1,11 +1,13 @@
 import textwrap
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import yaml
+from astropy.io import fits
 
 from review.event_index import EventIndex, epoch_file_exists
-from review.pipeline_labels import parse_diff_config
+from review.pipeline_labels import list_lightcurve_options, parse_diff_config
 
 
 def _write_minimal_event(tmp: Path) -> Path:
@@ -37,6 +39,8 @@ def _write_minimal_event(tmp: Path) -> Path:
                 "filename": "tess2020019142923-s0023-1-3-0165-s_ffic.fits",
                 "path": "/data/tess2020019142923-s0023-1-3-0165-s_ffic.fits",
                 "group_id": 0,
+                "group_dx": 0.0,
+                "group_dy": 0.01,
                 "hotpants_hp_d_ok": True,
             }
         ]
@@ -70,6 +74,8 @@ def test_parse_diff_config(tmp_path):
     assert labels.diff_label == "hp_d"
     assert labels.lc_dir == "lc_prf_on_diffs"
     assert labels.additional_targets == ["offset_top"]
+    options = dict(list_lightcurve_options(labels))
+    assert options["offset_top"] == "lightcurve_offset_top.csv"
 
 
 def test_event_index_resolves_master_paths(tmp_path):
@@ -80,3 +86,21 @@ def test_event_index_resolves_master_paths(tmp_path):
     assert row["product_id"] == "tess2020019142923"
     assert epoch_file_exists(row)["diff_exists"]
     assert "tess2020019142923_hp_d.fits" in row["diff_path"]
+    assert row["group_dx"] == 0.0
+    assert row["group_dy"] == 0.01
+
+
+def test_event_index_resolves_template_from_ws_templates(tmp_path):
+    event = _write_minimal_event(tmp_path)
+    physical = tmp_path / "template_data"
+    physical.mkdir()
+    tmpl_name = "syndiff_template_s0023_1_3_dx0.000_dy0.010.fits"
+    data = np.zeros((10, 10), dtype=np.float32)
+    fits.PrimaryHDU(data=data).writeto(physical / tmpl_name, overwrite=True)
+    (event / "ws" / "templates").symlink_to(physical)
+
+    idx = EventIndex.load(event)
+    row = idx.epochs.iloc[0]
+    assert row["template_path"] is not None
+    assert tmpl_name in row["template_path"]
+    assert idx.template_dir == physical.resolve()

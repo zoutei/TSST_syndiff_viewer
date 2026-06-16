@@ -143,5 +143,5 @@ def list_lightcurve_options(labels: PipelineLabels) -> list[tuple[str, str]]:
     """Return ``[(display_name, filename), ...]`` for the LC selector dropdown."""
     options = [("primary", "lightcurve.csv")]
     for name in labels.additional_targets:
-        options.append((f"offset_{name}", f"lightcurve_offset_{name}.csv"))
+        options.append((name, f"lightcurve_{name}.csv"))
     return options

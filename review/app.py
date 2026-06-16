@@ -11,8 +11,9 @@ import plotly.graph_objects as go
 from dash import Dash, Input, Output, State, callback, ctx, dcc, html, no_update
 
 from .config import ReviewConfig
+from .crop_cache import ensure_cropped_fits
 from .ds9 import Ds9Controller
-from .event_index import EventIndex, epoch_file_exists
+from .event_index import EventIndex
 from .mount import is_healthy, list_events, list_photometry_dirs, list_workspaces
 from .pipeline_labels import list_lightcurve_options, parse_diff_config
 from .smoothing import SmoothingMode, apply_smoothing
@@ -28,22 +29,6 @@ def _smoothing_mode_from_ui(mode: str) -> SmoothingMode:
     if mode == "Savitzky-Golay":
         return "savgol"
     return "none"
-
-
-def _badge(label: str, exists: bool) -> html.Span:
-    color = "#2e7d32" if exists else "#9e9e9e"
-    return html.Span(
-        label,
-        style={
-            "display": "inline-block",
-            "marginRight": "6px",
-            "padding": "2px 8px",
-            "borderRadius": "4px",
-            "background": color,
-            "color": "white",
-            "fontSize": "12px",
-        },
-    )
 
 
 def _pick_dropdown_value(current: str | None, options: list[dict[str, str]], default: str) -> str:
@@ -210,8 +195,6 @@ def create_app(cfg: ReviewConfig) -> Dash:
                             html.H4("Epoch"),
                             html.Div(id="epoch-meta"),
                             html.Hr(),
-                            html.Div(id="file-badges"),
-                            html.Hr(),
                             html.H5("Selected FFI"),
                             _ds9_button_grid(
                                 [
@@ -245,7 +228,6 @@ def create_app(cfg: ReviewConfig) -> Dash:
                                 style={"display": "none"},
                             ),
                             html.Div(id="ds9-status", style={"marginTop": "10px"}),
-                            html.Div(id="path-copy", style={"fontSize": "11px", "marginTop": "8px"}),
                         ],
                         style={
                             "flex": "3",
@@ -483,6 +465,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
                 "epochs": idx.epochs.to_dict(orient="list"),
                 "regions_path": str(idx.regions_path) if idx.regions_path.is_file() else None,
                 "fits_event_dir": str(cfg.source_event_dir(event)),
+                "crop_bounds": idx.crop_bounds,
                 "tessreduce": tessreduce_store_payload(tess),
                 **idx.kernel_workspace_paths(),
             }
@@ -789,21 +772,18 @@ def create_app(cfg: ReviewConfig) -> Dash:
 
     @callback(
         Output("epoch-meta", "children"),
-        Output("file-badges", "children"),
-        Output("path-copy", "children"),
         Input("event-index-store", "data"),
         Input("selected-epoch", "data"),
     )
     def update_sidebar(store: dict | None, epoch_idx: int | None):
         if not store or epoch_idx is None:
-            return "Click a Syndiff point to select an epoch.", [], ""
+            return "Click a Syndiff point to select an epoch."
         df = pd.DataFrame(store["epochs"])
         row = df.loc[df["epoch_idx"] == epoch_idx]
         if row.empty:
-            return "Epoch not found.", [], ""
+            return "Epoch not found."
         r = row.iloc[0]
-        exists = epoch_file_exists(r)
-        meta = html.Div(
+        return html.Div(
             [
                 html.Div(f"epoch_idx: {int(r['epoch_idx'])}"),
                 html.Div(f"BTJD: {r['btjd']:.6f}"),
@@ -814,26 +794,6 @@ def create_app(cfg: ReviewConfig) -> Dash:
                 html.Div(f"hotpants_ok: {r.get('hotpants_ok')}"),
             ]
         )
-        badges = [
-            _badge("diff", exists["diff_exists"]),
-            _badge("sci", exists["sci_exists"]),
-            _badge("template", exists["template_exists"]),
-        ]
-        paths = html.Pre(
-            "\n".join(
-                f"{k}: {r.get(k)}"
-                for k in (
-                    "diff_path",
-                    "sci_path",
-                    "template_path",
-                    "conv_template_path",
-                    "bkg_path",
-                )
-                if r.get(k)
-            ),
-            style={"whiteSpace": "pre-wrap"},
-        )
-        return meta, badges, paths
 
     def _row_from_store(store: dict | None, epoch_idx: int | None) -> pd.Series | None:
         if not store or epoch_idx is None:
@@ -902,6 +862,34 @@ def create_app(cfg: ReviewConfig) -> Dash:
         btn = ctx.triggered_id
         regions = store.get("regions_path") if store else None
         mask_path = store.get("mask_path") if store else None
+        crop_bounds = store.get("crop_bounds") if store else None
+        event_key = store.get("event") if store else "event"
+        workspace = store.get("workspace") if store else "ws"
+
+        def _resolve_cropped_path(
+            path: str | None,
+            *,
+            kind: str,
+            label: str,
+        ) -> tuple[str | None, str | None]:
+            """Return (display_path, warning_message)."""
+            if not path:
+                return None, None
+            if crop_bounds is None:
+                return path, f"No targets.reg ROI; showing full frame for {label}."
+            try:
+                cropped = ensure_cropped_fits(
+                    path,
+                    kind=kind,  # type: ignore[arg-type]
+                    crop_bounds=crop_bounds,
+                    cache_root=cfg.cache_root_expanded,
+                    event_key=str(event_key),
+                    workspace=str(workspace),
+                )
+                return str(cropped), None
+            except Exception as exc:
+                log.exception("Crop failed for %s", label)
+                return path, f"Crop failed for {label}; showing full frame ({exc})."
 
         def _enqueue(path: str | None, *, is_diff: bool, label: str, needs_epoch: bool = True):
             if needs_epoch and epoch_idx is None:
@@ -912,15 +900,38 @@ def create_app(cfg: ReviewConfig) -> Dash:
             color = "#2e7d32" if res.ok else "#c62828"
             return html.Span(res.message, style={"color": color})
 
+        def _enqueue_cropped(
+            path: str | None,
+            *,
+            kind: str,
+            label: str,
+            needs_epoch: bool = True,
+        ):
+            if needs_epoch and epoch_idx is None:
+                return "Select an epoch first."
+            if not path:
+                return f"No path for {label}."
+            display_path, warning = _resolve_cropped_path(path, kind=kind, label=label)
+            if not display_path:
+                return f"No path for {label}."
+            res = ds9.enqueue_load(display_path, regions=regions, is_diff=False, label=label)
+            color = "#2e7d32" if res.ok else "#c62828"
+            msg = res.message
+            if warning and res.ok:
+                msg = f"{msg} ({warning})"
+            return html.Span(msg, style={"color": color})
+
         row = _row_from_store(store, epoch_idx)
 
         if btn == "btn-diff":
             return _enqueue(row["diff_path"] if row is not None else None, is_diff=True, label="diff")
         if btn == "btn-sci":
-            return _enqueue(row["sci_path"] if row is not None else None, is_diff=False, label="FFI")
+            return _enqueue_cropped(
+                row["sci_path"] if row is not None else None, kind="ffi", label="FFI"
+            )
         if btn == "btn-template":
-            return _enqueue(
-                row["template_path"] if row is not None else None, is_diff=False, label="template"
+            return _enqueue_cropped(
+                row["template_path"] if row is not None else None, kind="template", label="template"
             )
         if btn == "btn-conv-template":
             path = row.get("conv_template_path") or row.get("conv_path") if row is not None else None

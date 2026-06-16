@@ -12,6 +12,9 @@ from review.support.paths import DEFAULT_MANIFEST_BASENAME, TARGETS_DS9_REGION_B
 
 log = logging.getLogger(__name__)
 
+CLUSTER_TEMPLATE_JOB_BASENAME = "cluster_template_job.json"
+CONVOLVED_TEMPLATES_CSV_BASENAME = "convolved_templates.csv"
+
 PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT.parent
 DEFAULT_CACHE_ROOT = PROJECT_ROOT / ".cache" / "workspace"
@@ -54,6 +57,10 @@ def discover_metadata_files(source_root: Path) -> list[Path]:
         if manifest.is_file():
             files.append(manifest)
 
+        cluster_job = event_dir / CLUSTER_TEMPLATE_JOB_BASENAME
+        if cluster_job.is_file():
+            files.append(cluster_job)
+
         for ws_name in list_workspaces(event_dir):
             ws_dir = event_dir / ws_name
             diff_cfg = ws_dir / "diff_config.yaml"
@@ -62,6 +69,9 @@ def discover_metadata_files(source_root: Path) -> list[Path]:
             targets_reg = ws_dir / TARGETS_DS9_REGION_BASENAME
             if targets_reg.is_file():
                 files.append(targets_reg)
+            for csv_path in sorted(ws_dir.glob(f"**/{CONVOLVED_TEMPLATES_CSV_BASENAME}")):
+                if csv_path.is_file():
+                    files.append(csv_path)
             for lc_name in list_photometry_dirs(ws_dir):
                 lc_dir = ws_dir / lc_name
                 for csv_path in sorted(lc_dir.glob("*.csv")):

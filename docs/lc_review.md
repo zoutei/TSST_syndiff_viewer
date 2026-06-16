@@ -45,11 +45,27 @@ python scripts/test_ds9_load.py /path/to/image.fits --wait 10
 
 ## Metadata cache
 
-On startup (and when you click Reload), the app copies non-FITS workspace files (CSVs, YAML, DS9 region files) from the NFS source into `.cache/workspace/` under the project root. Files whose modification time already matches the cache are skipped. FITS images are always read from NFS for DS9.
+On startup (and when you click Reload), the app copies non-FITS workspace files from the NFS source into `.cache/workspace/` under the project root:
+
+- Per-event manifest (`syndiff_ffi_frames.csv`) and `cluster_template_job.json`
+- Per-workspace `diff_config.yaml`, `targets.reg`, light-curve CSVs
+- `convolved_templates.csv` manifests when present under a workspace
+
+Files whose modification time already matches the cache are skipped. FITS images are read from NFS for DS9; cropped FFI/template previews are written under `.cache/crops/`.
 
 Use `--no-sync` to skip syncing, or `--cache-dir` to override the cache location.
 
-FITS file-existence badges in the sidebar are resolved on demand when you select an epoch (not during initial index build), which keeps load fast.
+## FITS cropping for DS9
+
+Diff images and pipeline products are already cropped to the diff ROI. Full-chip FFIs and syndiff templates are cropped on demand when you click **Open FFI** or **Open Template**:
+
+1. Crop bounds are parsed from `targets.reg` in the selected workspace.
+2. A cropped FITS is written to `.cache/crops/{event}/{workspace}/`.
+3. DS9 loads the cached crop (reused until the source FITS mtime changes).
+
+If `targets.reg` has no ROI comment, DS9 opens the full frame and the status line notes the fallback.
+
+Template paths are resolved from `{workspace}/templates` (symlink) using manifest `group_dx`/`group_dy` offsets. Convolved templates are looked up via `convolved_templates.csv` in the conv-template output directory.
 
 ## Tests
 

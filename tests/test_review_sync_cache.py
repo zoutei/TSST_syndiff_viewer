@@ -1,11 +1,12 @@
 import shutil
+import time
 from pathlib import Path
 
 import pandas as pd
 import yaml
 
 from review.event_index import EventIndex, epoch_file_exists
-from review.sync_cache import discover_metadata_files, needs_update, sync_workspace_metadata
+from review.sync_cache import CLUSTER_TEMPLATE_JOB_BASENAME, discover_metadata_files, needs_update, sync_workspace_metadata
 
 
 def _write_event(tmp: Path, label: str = "s0023_test") -> Path:
@@ -85,18 +86,22 @@ def test_needs_update_recopies_changed_mtime(tmp_path):
     src = tmp_path / "a.csv"
     dst = tmp_path / "b.csv"
     src.write_text("v1\n")
+    time.sleep(0.01)
     dst.write_text("v0\n")
     assert needs_update(src, dst)
 
 
 def test_discover_metadata_files_excludes_fits(tmp_path):
     source = _source_layout(tmp_path)
+    (source / "events" / "event_a" / CLUSTER_TEMPLATE_JOB_BASENAME).write_text("{}")
     discovered = discover_metadata_files(source)
     suffixes = {p.suffix for p in discovered}
     assert ".csv" in suffixes
     assert ".yaml" in suffixes
     assert ".reg" in suffixes
+    assert ".json" in suffixes
     assert ".fits" not in suffixes
+    assert any(p.name == CLUSTER_TEMPLATE_JOB_BASENAME for p in discovered)
 
 
 def test_sync_copies_metadata_not_fits(tmp_path):
