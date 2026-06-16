@@ -1,0 +1,25 @@
+# Laptop review tool — STScI NFS workspace
+mount_root: /System/Volumes/Data/astro/armin/koji/syndiff/workspace
+tessreduce_root: /System/Volumes/Data/astro/armin/koji/tessreduce_data
+
+# cache_root: /path/to/custom/cache   # optional; default: <repo>/.cache/workspace
+sync_on_start: true
+
+ds9_path: SAOImageDS9   # macOS: open -a SAOImageDS9
+# ds9_xpa_dir: /Applications/SAOImageDS9.app/Contents/MacOS
+ds9_diff_scale_min: -10
+ds9_diff_scale_max: 10
+ds9_percentile_scale: 90
+host: 127.0.0.1
+port: 8050
+
+default_event: s0023_c1_k3_2020ftl
+default_workspace: ws
+default_lc: primary
+
+gap_threshold_days: 1.0
+gap_auto: true
+bin_width_hours: 6
+bin_sigma: 3.0
+savgol_window: 11
+savgol_polyorder: 2
