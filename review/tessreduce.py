@@ -28,6 +28,13 @@ class TessreduceLightCurve:
     data: pd.DataFrame
 
 
+_tessreduce_cache: dict[tuple[str, str], TessreduceLightCurve] = {}
+
+
+def clear_tessreduce_cache() -> None:
+    _tessreduce_cache.clear()
+
+
 def parse_event_label(event_label: str) -> tuple[int, str] | None:
     """Return ``(sector, sn_name)`` from ``s0023_c1_k3_2020ftl``."""
     match = _EVENT_LABEL_RE.match(str(event_label).strip())
@@ -83,14 +90,20 @@ def _read_tessreduce_csv(path: Path) -> pd.DataFrame:
 
 
 def load_tessreduce_for_event(event_label: str, tessreduce_root: str | Path) -> TessreduceLightCurve:
+    key = (str(event_label), str(Path(tessreduce_root).expanduser().resolve()))
+    if key in _tessreduce_cache:
+        return _tessreduce_cache[key]
     path = tessreduce_csv_path(event_label, tessreduce_root)
     if path is None:
-        return TessreduceLightCurve(path=None, data=pd.DataFrame(columns=["btjd", "flux", "eflux"]))
-    try:
-        data = _read_tessreduce_csv(path)
-    except (OSError, ValueError, pd.errors.ParserError):
-        return TessreduceLightCurve(path=path, data=pd.DataFrame(columns=["btjd", "flux", "eflux"]))
-    return TessreduceLightCurve(path=path, data=data)
+        lc = TessreduceLightCurve(path=None, data=pd.DataFrame(columns=["btjd", "flux", "eflux"]))
+    else:
+        try:
+            data = _read_tessreduce_csv(path)
+            lc = TessreduceLightCurve(path=path, data=data)
+        except (OSError, ValueError, pd.errors.ParserError):
+            lc = TessreduceLightCurve(path=path, data=pd.DataFrame(columns=["btjd", "flux", "eflux"]))
+    _tessreduce_cache[key] = lc
+    return lc
 
 
 def tessreduce_store_payload(lc: TessreduceLightCurve) -> dict[str, object]:

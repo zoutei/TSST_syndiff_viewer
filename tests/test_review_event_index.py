@@ -6,7 +6,14 @@ import pandas as pd
 import yaml
 from astropy.io import fits
 
-from review.event_index import EventIndex, epoch_file_exists
+from review.event_index import (
+    EventIndex,
+    clear_index_cache,
+    epoch_file_exists,
+    get_master_index,
+    get_workspace_context,
+    master_index_is_cached,
+)
 from review.pipeline_labels import list_lightcurve_options, parse_diff_config
 
 
@@ -104,3 +111,39 @@ def test_event_index_resolves_template_from_ws_templates(tmp_path):
     assert row["template_path"] is not None
     assert tmpl_name in row["template_path"]
     assert idx.template_dir == physical.resolve()
+
+
+def test_master_index_cache_reuses_scan(tmp_path):
+    clear_index_cache()
+    event = _write_minimal_event(tmp_path)
+    fits_event = event.resolve()
+    assert not master_index_is_cached(fits_event, "ws")
+    first = get_master_index(fits_event, "ws")
+    assert master_index_is_cached(fits_event, "ws")
+    second = get_master_index(fits_event, "ws")
+    assert first is second
+    clear_index_cache()
+    assert not master_index_is_cached(fits_event, "ws")
+
+
+def test_target_swap_reuses_epoch_paths(tmp_path):
+    clear_index_cache()
+    event = _write_minimal_event(tmp_path)
+    idx_primary = EventIndex.load(event, lc_name="primary")
+    idx_primary_again = EventIndex.load(event, lc_name="primary")
+    assert len(idx_primary.epochs) == len(idx_primary_again.epochs)
+    assert idx_primary.epochs.iloc[0]["flux"] == idx_primary_again.epochs.iloc[0]["flux"]
+    clear_index_cache()
+
+
+def test_workspace_context_reused_across_targets(tmp_path):
+    clear_index_cache()
+    event = _write_minimal_event(tmp_path)
+    ctx1 = get_workspace_context(event, event, "ws")
+    ctx2 = get_workspace_context(event, event, "ws")
+    assert ctx1 is ctx2
+    EventIndex.load(event, lc_name="primary")
+    EventIndex.load(event, lc_name="primary")
+    ctx3 = get_workspace_context(event, event, "ws")
+    assert ctx3 is ctx1
+    clear_index_cache()

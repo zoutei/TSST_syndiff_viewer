@@ -45,7 +45,7 @@ python scripts/test_ds9_load.py /path/to/image.fits --wait 10
 
 ## Metadata cache
 
-On startup (and when you click Reload), the app copies non-FITS workspace files from the NFS source into `.cache/workspace/` under the project root:
+On startup the app copies non-FITS workspace files from the NFS source into `.cache/workspace/` under the project root:
 
 - Per-event manifest (`syndiff_ffi_frames.csv`) and `cluster_template_job.json`
 - Per-workspace `diff_config.yaml`, `targets.reg`, light-curve CSVs
@@ -54,6 +54,12 @@ On startup (and when you click Reload), the app copies non-FITS workspace files 
 Files whose modification time already matches the cache are skipped. FITS images are read from NFS for DS9; cropped FFI/template previews are written under `.cache/crops/`.
 
 Use `--no-sync` to skip syncing, or `--cache-dir` to override the cache location.
+
+### Refresh lists vs plot loading
+
+**Refresh lists** re-scans NFS for new events and workspaces and updates the dropdown options. It shows a spinner while syncing metadata for the current event. It does **not** reload the plot.
+
+The plot loads when you pick an event, workspace, photometry dir, or target from the dropdowns. Subsequent target changes within the same workspace reuse a cached NFS `master/` index so switching targets stays fast.
 
 ## FITS cropping for DS9
 

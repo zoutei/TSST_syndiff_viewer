@@ -22,8 +22,8 @@ from review.support.paths import (
     master_root,
 )
 from review.support.templates import (
+    ConvTemplateIndex,
     find_template_by_offset,
-    lookup_convolved_template,
     parse_crop_bounds_from_targets_reg,
     resolve_template_dir,
 )
@@ -34,6 +34,140 @@ from .pipeline_labels import PipelineLabels, list_lightcurve_options, parse_diff
 log = logging.getLogger(__name__)
 
 CLUSTER_TEMPLATE_JOB_BASENAME = "cluster_template_job.json"
+
+_master_index_cache: dict[tuple[str, str], "_MasterIndex"] = {}
+_epoch_paths_cache: dict[tuple[str, str, str, str], pd.DataFrame] = {}
+_workspace_context_cache: dict[tuple[str, str, str], "_WorkspaceContext"] = {}
+
+_FLUX_COLUMNS = ("flux", "eflux", "snr", "btjd")
+
+
+def clear_index_cache() -> None:
+    """Drop all in-memory NFS index caches (call after metadata refresh)."""
+    _master_index_cache.clear()
+    _epoch_paths_cache.clear()
+    _workspace_context_cache.clear()
+
+
+def master_index_is_cached(fits_event_path: str | Path, workspace_subdir: str) -> bool:
+    key = (str(Path(fits_event_path).resolve()), workspace_subdir)
+    return key in _master_index_cache
+
+
+def get_master_index(fits_event_path: Path, workspace_subdir: str) -> _MasterIndex:
+    """Return cached master/ index, building it on first access only."""
+    key = (str(fits_event_path.resolve()), workspace_subdir)
+    if key not in _master_index_cache:
+        master = Path(master_root(str(fits_event_path), workspace_subdir))
+        fits_ws = fits_event_path / workspace_subdir
+        _master_index_cache[key] = _MasterIndex.build(master, fits_ws)
+    return _master_index_cache[key]
+
+
+@dataclass
+class _WorkspaceContext:
+    """Cached metadata and path indexes shared across targets in one workspace."""
+
+    labels: PipelineLabels
+    manifest_df: pd.DataFrame
+    manifest_by_pid: dict[str, dict[str, Any]]
+    crop_bounds: dict | None
+    template_dir: Path | None
+    conv_templates_dir: Path | None
+    conv_template_index: ConvTemplateIndex
+    template_cache: "_TemplatePathCache"
+    regions_path: str | None
+    mask_path: str | None
+    hotpants_ok_col: str
+    kernel_paths: dict[str, Any]
+
+
+def _workspace_context_key(
+    event_path: Path, fits_path: Path, workspace_subdir: str
+) -> tuple[str, str, str]:
+    return (str(event_path.resolve()), str(fits_path.resolve()), workspace_subdir)
+
+
+def _manifest_by_pid(manifest_df: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for _, row in manifest_df.iterrows():
+        fname = str(row.get("filename") or row.get("path") or "")
+        pid = tess_product_id_from_ffi_path(fname)
+        if pid:
+            out[pid] = row.to_dict()
+    return out
+
+
+def _kernel_workspace_paths(fits_ws: Path, labels: PipelineLabels) -> dict[str, Any]:
+    kernel_fit_dir = fits_ws / labels.kernel_fit_dir if labels.kernel_fit_dir else None
+
+    def _file_in_kf(basename: str) -> Path | None:
+        if kernel_fit_dir is None or not kernel_fit_dir.is_dir():
+            return None
+        p = kernel_fit_dir / basename
+        return p if p.is_file() else None
+
+    has_kernel_fit = kernel_fit_dir is not None and kernel_fit_dir.is_dir()
+    mask = fits_ws / "shared_mask.fits"
+    return {
+        "has_kernel_fit": has_kernel_fit,
+        "kernel_fit_dir": str(kernel_fit_dir) if kernel_fit_dir else None,
+        "kernel_reference_path": str(p) if (p := _file_in_kf("ffi.fits")) else None,
+        "kernel_template_path": str(p) if (p := _file_in_kf("template.fits")) else None,
+        "kernel_hp1_diff_path": str(p) if (p := _file_in_kf("hp1_diff.fits")) else None,
+        "kernel_hp1_bkg_path": str(p) if (p := _file_in_kf("hp1_bkg.fits")) else None,
+        "kernel_hp2_diff_path": str(p) if (p := _file_in_kf("hp2_diff.fits")) else None,
+        "kernel_hp2_bkg_path": str(p) if (p := _file_in_kf("hp2_bkg.fits")) else None,
+        "kernel_sci1_clean_path": str(p) if (p := _file_in_kf("sci1_clean.fits")) else None,
+        "kernel_phot_bkg_fine_path": str(p)
+        if (p := _file_in_kf("phot_bkg_fine_on_hp1_diff.fits"))
+        else None,
+        "mask_path": str(mask) if mask.is_file() else None,
+        "hotpants_stages": [
+            {"diffs": s.diffs, "bkg": s.bkg, "convolved": s.convolved}
+            for s in labels.hotpants_stages
+        ],
+    }
+
+
+def get_workspace_context(
+    event_path: Path,
+    fits_path: Path,
+    workspace_subdir: str,
+) -> _WorkspaceContext:
+    key = _workspace_context_key(event_path, fits_path, workspace_subdir)
+    cached = _workspace_context_cache.get(key)
+    if cached is not None:
+        return cached
+
+    meta_ws = event_path / workspace_subdir
+    fits_ws = fits_path / workspace_subdir
+    labels = parse_diff_config(meta_ws / "diff_config.yaml")
+    manifest_df = load_frame_manifest(str(event_path))
+    template_dir = resolve_template_dir(fits_ws)
+    conv_templates_dir = (
+        fits_ws / labels.conv_template_label if labels.conv_template_label else None
+    )
+    regions = meta_ws / TARGETS_DS9_REGION_BASENAME
+    mask = fits_ws / "shared_mask.fits"
+    diff_safe = sanitize_workspace_label(labels.diff_label)
+
+    ctx = _WorkspaceContext(
+        labels=labels,
+        manifest_df=manifest_df,
+        manifest_by_pid=_manifest_by_pid(manifest_df),
+        crop_bounds=parse_crop_bounds_from_targets_reg(meta_ws),
+        template_dir=template_dir,
+        conv_templates_dir=conv_templates_dir,
+        conv_template_index=ConvTemplateIndex.from_dir(conv_templates_dir),
+        template_cache=_TemplatePathCache(template_dir=template_dir, labels=labels),
+        regions_path=str(regions) if regions.is_file() else None,
+        mask_path=str(mask) if mask.is_file() else None,
+        hotpants_ok_col=f"hotpants_{diff_safe}_ok",
+        kernel_paths=_kernel_workspace_paths(fits_ws, labels),
+    )
+    _workspace_context_cache[key] = ctx
+    return ctx
 
 
 @dataclass
@@ -63,37 +197,39 @@ class EventIndex:
     ) -> EventIndex:
         event_path = Path(event_dir).resolve()
         fits_path = Path(fits_event_dir).resolve() if fits_event_dir else event_path
-        ws = event_path / workspace_subdir
-        fits_ws = fits_path / workspace_subdir
-        labels = parse_diff_config(ws / "diff_config.yaml")
+        ws_ctx = get_workspace_context(event_path, fits_path, workspace_subdir)
+        labels = ws_ctx.labels
         resolved_lc_dir = lc_dir or labels.lc_dir
         if lc_filename is None:
             lc_filename = _lc_filename_for_name(labels, lc_name)
 
-        lc_path = ws / resolved_lc_dir / lc_filename
+        lc_path = event_path / workspace_subdir / resolved_lc_dir / lc_filename
         lc_df = _read_lightcurve(lc_path)
-        manifest_df = load_frame_manifest(str(event_path))
-
-        crop_bounds = parse_crop_bounds_from_targets_reg(ws)
-        template_dir = resolve_template_dir(fits_ws)
-        conv_templates_dir = (
-            fits_ws / labels.conv_template_label if labels.conv_template_label else None
-        )
 
         cluster_job_path = event_path / CLUSTER_TEMPLATE_JOB_BASENAME
         if not cluster_job_path.is_file():
             log.debug("No %s under %s", CLUSTER_TEMPLATE_JOB_BASENAME, event_path)
 
-        epochs = _build_epoch_table(
-            metadata_event_path=event_path,
-            fits_event_path=fits_path,
-            workspace_subdir=workspace_subdir,
-            labels=labels,
-            lc_df=lc_df,
-            manifest_df=manifest_df,
-            template_dir=template_dir,
-            conv_templates_dir=conv_templates_dir,
+        paths_key = (
+            str(event_path.resolve()),
+            str(fits_path.resolve()),
+            workspace_subdir,
+            resolved_lc_dir,
         )
+        cached_paths = _epoch_paths_cache.get(paths_key)
+        if cached_paths is not None and _lc_rows_compatible(cached_paths, lc_df):
+            epochs = _merge_lc_flux(cached_paths, lc_df)
+        else:
+            master_index = get_master_index(fits_path, workspace_subdir)
+            epochs = _build_epoch_table(
+                ws_ctx=ws_ctx,
+                metadata_event_path=event_path,
+                fits_event_path=fits_path,
+                workspace_subdir=workspace_subdir,
+                lc_df=lc_df,
+                master_index=master_index,
+            )
+            _epoch_paths_cache[paths_key] = epochs.drop(columns=list(_FLUX_COLUMNS), errors="ignore")
         return cls(
             event_dir=event_path,
             target_label=event_path.name,
@@ -103,9 +239,9 @@ class EventIndex:
             lc_name=lc_name,
             lc_dir=resolved_lc_dir,
             fits_event_dir=fits_path,
-            crop_bounds=crop_bounds,
-            template_dir=template_dir,
-            conv_templates_dir=conv_templates_dir,
+            crop_bounds=ws_ctx.crop_bounds,
+            template_dir=ws_ctx.template_dir,
+            conv_templates_dir=ws_ctx.conv_templates_dir,
         )
 
     @property
@@ -188,29 +324,8 @@ class EventIndex:
 
     def kernel_workspace_paths(self) -> dict[str, str | None]:
         """Workspace-level kernel_fit paths for the Dash store."""
-        return {
-            "has_kernel_fit": self.has_kernel_fit,
-            "kernel_fit_dir": str(self.kernel_fit_dir) if self.kernel_fit_dir else None,
-            "kernel_reference_path": str(self.kernel_reference_path)
-            if self.kernel_reference_path
-            else None,
-            "kernel_template_path": str(self.kernel_template_path) if self.kernel_template_path else None,
-            "kernel_hp1_diff_path": str(self.kernel_hp1_diff_path) if self.kernel_hp1_diff_path else None,
-            "kernel_hp1_bkg_path": str(self.kernel_hp1_bkg_path) if self.kernel_hp1_bkg_path else None,
-            "kernel_hp2_diff_path": str(self.kernel_hp2_diff_path) if self.kernel_hp2_diff_path else None,
-            "kernel_hp2_bkg_path": str(self.kernel_hp2_bkg_path) if self.kernel_hp2_bkg_path else None,
-            "kernel_sci1_clean_path": str(self.kernel_sci1_clean_path)
-            if self.kernel_sci1_clean_path
-            else None,
-            "kernel_phot_bkg_fine_path": str(self.kernel_phot_bkg_fine_path)
-            if self.kernel_phot_bkg_fine_path
-            else None,
-            "mask_path": str(self.mask_path) if self.mask_path.is_file() else None,
-            "hotpants_stages": [
-                {"diffs": s.diffs, "bkg": s.bkg, "convolved": s.convolved}
-                for s in self.labels.hotpants_stages
-            ],
-        }
+        ctx = get_workspace_context(self.event_dir, self.fits_event_dir, self.workspace_subdir)
+        return ctx.kernel_paths
 
 
 @dataclass
@@ -309,6 +424,31 @@ def _lc_filename_for_name(labels: PipelineLabels, lc_name: str) -> str:
     raise ValueError(f"Unknown light curve name: {lc_name!r}")
 
 
+def _lc_rows_compatible(paths_df: pd.DataFrame, lc_df: pd.DataFrame) -> bool:
+    if len(paths_df) != len(lc_df):
+        return False
+    if "filename" not in paths_df.columns or "filename" not in lc_df.columns:
+        return len(paths_df) == len(lc_df)
+    left = paths_df["filename"].fillna("").astype(str)
+    right = lc_df["filename"].fillna("").astype(str)
+    return left.equals(right)
+
+
+def _merge_lc_flux(paths_df: pd.DataFrame, lc_df: pd.DataFrame) -> pd.DataFrame:
+    out = paths_df.copy()
+    flux = lc_df["flux"]
+    eflux = lc_df["eflux"] if "eflux" in lc_df.columns else pd.Series(np.nan, index=lc_df.index)
+    btjd = lc_df["btjd"]
+    out["btjd"] = btjd.astype(float).values
+    out["flux"] = flux.astype(float).values
+    out["eflux"] = eflux.astype(float).values
+    out["snr"] = [
+        float(f) / float(e) if pd.notna(f) and pd.notna(e) and float(e) != 0 else np.nan
+        for f, e in zip(out["flux"], out["eflux"], strict=True)
+    ]
+    return out
+
+
 def _read_lightcurve(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     if "btjd" not in df.columns:
@@ -335,35 +475,25 @@ def _float_or_none(value: Any) -> float | None:
 
 def _build_epoch_table(
     *,
+    ws_ctx: _WorkspaceContext,
     metadata_event_path: Path,
     fits_event_path: Path,
     workspace_subdir: str,
-    labels: PipelineLabels,
     lc_df: pd.DataFrame,
-    manifest_df: pd.DataFrame,
-    template_dir: Path | None,
-    conv_templates_dir: Path | None,
+    master_index: _MasterIndex | None = None,
 ) -> pd.DataFrame:
-    meta_ws = metadata_event_path / workspace_subdir
+    del metadata_event_path  # retained for call-site clarity
     fits_ws = fits_event_path / workspace_subdir
-    master = Path(master_root(str(fits_event_path), workspace_subdir))
-    master_index = _MasterIndex.build(master, fits_ws)
-    template_cache = _TemplatePathCache(template_dir=template_dir, labels=labels)
+    labels = ws_ctx.labels
+    if master_index is None:
+        master_index = get_master_index(fits_event_path, workspace_subdir)
 
-    regions = meta_ws / TARGETS_DS9_REGION_BASENAME
-    mask = fits_ws / "shared_mask.fits"
-    regions_path = str(regions) if regions.is_file() else None
-    mask_path = str(mask) if mask.is_file() else None
-
-    diff_safe = sanitize_workspace_label(labels.diff_label)
-    hotpants_ok_col = f"hotpants_{diff_safe}_ok"
-
-    manifest_by_pid: dict[str, dict[str, Any]] = {}
-    for _, row in manifest_df.iterrows():
-        fname = str(row.get("filename") or row.get("path") or "")
-        pid = tess_product_id_from_ffi_path(fname)
-        if pid:
-            manifest_by_pid[pid] = row.to_dict()
+    manifest_by_pid = ws_ctx.manifest_by_pid
+    regions_path = ws_ctx.regions_path
+    mask_path = ws_ctx.mask_path
+    hotpants_ok_col = ws_ctx.hotpants_ok_col
+    template_cache = ws_ctx.template_cache
+    conv_index = ws_ctx.conv_template_index
 
     records: list[dict[str, Any]] = []
     for i, lc_row in lc_df.iterrows():
@@ -391,8 +521,8 @@ def _build_epoch_table(
 
         diff_path = _resolve_master_or_workspace(master_index, fits_ws, pid, labels.diff_label)
         conv_template_path = (
-            lookup_convolved_template(conv_templates_dir, group_dx, group_dy)
-            if conv_templates_dir is not None and group_dx is not None and group_dy is not None
+            conv_index.lookup(group_dx, group_dy)
+            if group_dx is not None and group_dy is not None
             else None
         )
         conv_path = (

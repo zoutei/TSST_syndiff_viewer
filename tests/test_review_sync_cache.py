@@ -6,7 +6,14 @@ import pandas as pd
 import yaml
 
 from review.event_index import EventIndex, epoch_file_exists
-from review.sync_cache import CLUSTER_TEMPLATE_JOB_BASENAME, discover_metadata_files, needs_update, sync_workspace_metadata
+from review.sync_cache import (
+    CLUSTER_TEMPLATE_JOB_BASENAME,
+    discover_event_metadata_files,
+    discover_metadata_files,
+    needs_update,
+    sync_event_metadata,
+    sync_workspace_metadata,
+)
 
 
 def _write_event(tmp: Path, label: str = "s0023_test") -> Path:
@@ -121,6 +128,15 @@ def test_sync_all_events(tmp_path):
     assert (cache / "events" / "event_a" / "syndiff_ffi_frames.csv").is_file()
     assert (cache / "events" / "event_b" / "syndiff_ffi_frames.csv").is_file()
     assert result.copied == len(discover_metadata_files(source))
+
+
+def test_sync_event_metadata_only_one_event(tmp_path):
+    source = _source_layout(tmp_path)
+    cache = tmp_path / "cache"
+    result = sync_event_metadata(source, cache, "event_a")
+    assert (cache / "events" / "event_a" / "syndiff_ffi_frames.csv").is_file()
+    assert not (cache / "events" / "event_b" / "syndiff_ffi_frames.csv").exists()
+    assert result.copied == len(discover_event_metadata_files(source, "event_a"))
 
 
 def test_sync_skips_unchanged_on_second_run(tmp_path):

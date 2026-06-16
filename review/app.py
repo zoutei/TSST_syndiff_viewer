@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import numpy as np
@@ -13,14 +14,26 @@ from dash import Dash, Input, Output, State, callback, ctx, dcc, html, no_update
 from .config import ReviewConfig
 from .crop_cache import ensure_cropped_fits
 from .ds9 import Ds9Controller
-from .event_index import EventIndex
+from .event_index import EventIndex, clear_index_cache, master_index_is_cached
 from .mount import is_healthy, list_events, list_photometry_dirs, list_workspaces
 from .pipeline_labels import list_lightcurve_options, parse_diff_config
 from .smoothing import SmoothingMode, apply_smoothing
-from .sync_cache import sync_workspace_metadata
-from .tessreduce import load_tessreduce_for_event, tessreduce_store_payload
+from .sync_cache import sync_event_metadata, sync_workspace_metadata
+from .tessreduce import clear_tessreduce_cache, load_tessreduce_for_event, tessreduce_store_payload
 
 log = logging.getLogger(__name__)
+
+_StorePayload = tuple[dict[str, Any], str, dict[str, Any]]
+_store_payload_cache: dict[tuple[str, str, str, str], _StorePayload] = {}
+
+
+def clear_store_payload_cache() -> None:
+    """Drop cached Dash store payloads (call after metadata refresh)."""
+    _store_payload_cache.clear()
+
+
+def _store_payload_key(event: str, workspace: str, lc_dir: str, target: str) -> tuple[str, str, str, str]:
+    return (event, workspace, lc_dir, target)
 
 
 def _smoothing_mode_from_ui(mode: str) -> SmoothingMode:
@@ -57,6 +70,26 @@ def _parse_flux_offset(value: float | int | str | None) -> float:
         return 0.0
 
 
+def find_epoch_idx_by_product_id(epochs: dict[str, list] | pd.DataFrame, query: str | None) -> tuple[int | None, str]:
+    """Return ``(epoch_idx, error_message)`` for a product_id search query."""
+    if not query or not str(query).strip():
+        return None, "Enter a product ID."
+    df = pd.DataFrame(epochs) if isinstance(epochs, dict) else epochs
+    if df.empty or "product_id" not in df.columns:
+        return None, "No light-curve data loaded."
+    q = str(query).strip().lower()
+    pids = df["product_id"].fillna("").astype(str).str.lower()
+    exact = df.loc[pids == q]
+    if not exact.empty:
+        return int(exact.iloc[0]["epoch_idx"]), ""
+    contains = df.loc[pids.str.contains(re.escape(q), na=False)]
+    if len(contains) == 1:
+        return int(contains.iloc[0]["epoch_idx"]), ""
+    if len(contains) > 1:
+        return int(contains.iloc[0]["epoch_idx"]), f"{len(contains)} matches; selected first."
+    return None, f"No epoch with product_id matching {query!r}."
+
+
 def _legend_only_scatter(
     name: str,
     *,
@@ -91,6 +124,43 @@ def _ds9_button_grid(buttons: list[tuple[str, str]]) -> html.Div:
     )
 
 
+def _list_event_labels(cfg: ReviewConfig) -> list[str]:
+    events = list_events(cfg.source_mount_expanded) or list_events(cfg.data_mount_expanded)
+    if not events:
+        events = [cfg.default_event]
+    if cfg.default_event not in events:
+        events = [cfg.default_event, *events]
+    return events
+
+
+def _workspace_options(cfg: ReviewConfig, event: str) -> tuple[list[dict[str, str]], list[str]]:
+    workspaces = list_workspaces(cfg.event_dir(event))
+    options = [{"label": w, "value": w} for w in workspaces]
+    return options, workspaces
+
+
+def _photometry_options(
+    cfg: ReviewConfig, event: str, workspace: str | None
+) -> tuple[list[dict[str, str]], str | None]:
+    if not workspace:
+        return [], None
+    ws_dir = cfg.event_dir(event) / workspace
+    phot_dirs = list_photometry_dirs(ws_dir)
+    options = [{"label": d, "value": d} for d in phot_dirs]
+    default = parse_diff_config(ws_dir / "diff_config.yaml").lc_dir if phot_dirs else None
+    return options, default
+
+
+def _target_options(
+    cfg: ReviewConfig, event: str, workspace: str | None
+) -> tuple[list[dict[str, str]], str]:
+    if not workspace:
+        return [], cfg.default_lc
+    labels = parse_diff_config(cfg.event_dir(event) / workspace / "diff_config.yaml")
+    options = [{"label": name, "value": name} for name, _fname in list_lightcurve_options(labels)]
+    return options, cfg.default_lc
+
+
 def create_app(cfg: ReviewConfig) -> Dash:
     app = Dash(__name__, suppress_callback_exceptions=True)
     ds9 = Ds9Controller(
@@ -105,47 +175,60 @@ def create_app(cfg: ReviewConfig) -> Dash:
         metadata_root=cfg.data_mount_expanded,
         fits_root=cfg.source_mount_expanded,
     )
-    events = list_events(cfg.data_mount_expanded) or [cfg.default_event]
-    if cfg.default_event not in events:
-        events = [cfg.default_event] + events
+    events = _list_event_labels(cfg)
 
     app.layout = html.Div(
         [
             html.Div(
                 [
                     html.H3("SynDiff LC Review", style={"margin": 0}),
-                    dcc.Dropdown(
-                        id="event-select",
-                        options=[{"label": e, "value": e} for e in events],
-                        value=cfg.default_event,
-                        clearable=False,
-                        style={"width": "280px"},
+                    dcc.Loading(
+                        id="lists-loading",
+                        type="circle",
+                        color="#1976d2",
+                        children=html.Div(
+                            [
+                                dcc.Dropdown(
+                                    id="event-select",
+                                    options=[{"label": e, "value": e} for e in events],
+                                    value=cfg.default_event,
+                                    clearable=False,
+                                    style={"width": "280px"},
+                                ),
+                                dcc.Dropdown(
+                                    id="workspace-select",
+                                    options=[],
+                                    value=cfg.default_workspace,
+                                    clearable=False,
+                                    placeholder="Workspace",
+                                    style={"width": "200px"},
+                                ),
+                                dcc.Dropdown(
+                                    id="photometry-select",
+                                    options=[],
+                                    value=None,
+                                    clearable=False,
+                                    placeholder="Photometry",
+                                    style={"width": "200px"},
+                                ),
+                                dcc.Dropdown(
+                                    id="target-select",
+                                    options=[],
+                                    value=cfg.default_lc,
+                                    clearable=False,
+                                    placeholder="Target",
+                                    style={"width": "180px"},
+                                ),
+                            ],
+                            style={"display": "flex", "gap": "12px", "alignItems": "center", "flexWrap": "wrap"},
+                        ),
                     ),
-                    dcc.Dropdown(
-                        id="workspace-select",
-                        options=[],
-                        value=cfg.default_workspace,
-                        clearable=False,
-                        placeholder="Workspace",
-                        style={"width": "200px"},
+                    html.Button(
+                        "Refresh lists",
+                        id="reload-btn",
+                        n_clicks=0,
+                        title="Re-scan NFS for new events and workspaces. Does not reload the plot.",
                     ),
-                    dcc.Dropdown(
-                        id="photometry-select",
-                        options=[],
-                        value=None,
-                        clearable=False,
-                        placeholder="Photometry",
-                        style={"width": "200px"},
-                    ),
-                    dcc.Dropdown(
-                        id="target-select",
-                        options=[],
-                        value=cfg.default_lc,
-                        clearable=False,
-                        placeholder="Target",
-                        style={"width": "180px"},
-                    ),
-                    html.Button("Reload", id="reload-btn", n_clicks=0),
                     html.Button(
                         "Show TESSreduce",
                         id="tessreduce-toggle",
@@ -193,6 +276,28 @@ def create_app(cfg: ReviewConfig) -> Dash:
                     html.Div(
                         [
                             html.H4("Epoch"),
+                            html.Div(
+                                [
+                                    html.Label("Product ID", style={"fontSize": "13px"}),
+                                    html.Div(
+                                        [
+                                            dcc.Input(
+                                                id="product-id-search",
+                                                type="text",
+                                                placeholder="tess2020…",
+                                                style={"flex": "1", "minWidth": "0"},
+                                            ),
+                                            html.Button("Select", id="product-id-select-btn", n_clicks=0),
+                                        ],
+                                        style={"display": "flex", "gap": "6px", "marginTop": "4px"},
+                                    ),
+                                    html.Span(
+                                        id="product-id-search-status",
+                                        style={"fontSize": "12px", "color": "#616161"},
+                                    ),
+                                ],
+                                style={"marginBottom": "10px"},
+                            ),
                             html.Div(id="epoch-meta"),
                             html.Hr(),
                             html.H5("Selected FFI"),
@@ -355,6 +460,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
             dcc.Store(id="event-index-store"),
             dcc.Store(id="selected-epoch", data=None),
             dcc.Store(id="plot-click-listener", data=None),
+            dcc.Store(id="plot-load-token", data=0),
         ],
         style={"fontFamily": "system-ui, sans-serif"},
     )
@@ -363,13 +469,11 @@ def create_app(cfg: ReviewConfig) -> Dash:
         Output("workspace-select", "options"),
         Output("workspace-select", "value"),
         Input("event-select", "value"),
-        Input("reload-btn", "n_clicks"),
         State("workspace-select", "value"),
     )
-    def update_workspace_options(event: str, _n: int, current_ws: str | None):
+    def update_workspace_options(event: str, current_ws: str | None):
         try:
-            workspaces = list_workspaces(cfg.event_dir(event))
-            options = [{"label": w, "value": w} for w in workspaces]
+            options, _workspaces = _workspace_options(cfg, event)
             value = _pick_dropdown_value(current_ws, options, cfg.default_workspace)
             return options, value
         except Exception:
@@ -381,18 +485,14 @@ def create_app(cfg: ReviewConfig) -> Dash:
         Output("photometry-select", "value"),
         Input("event-select", "value"),
         Input("workspace-select", "value"),
-        Input("reload-btn", "n_clicks"),
         State("photometry-select", "value"),
     )
-    def update_photometry_options(event: str, workspace: str | None, _n: int, current_lc_dir: str | None):
+    def update_photometry_options(event: str, workspace: str | None, current_lc_dir: str | None):
         if not workspace:
             return [], None
         try:
-            ws_dir = cfg.event_dir(event) / workspace
-            phot_dirs = list_photometry_dirs(ws_dir)
-            options = [{"label": d, "value": d} for d in phot_dirs]
-            default = parse_diff_config(ws_dir / "diff_config.yaml").lc_dir
-            value = _pick_dropdown_value(current_lc_dir, options, default)
+            options, default = _photometry_options(cfg, event, workspace)
+            value = _pick_dropdown_value(current_lc_dir, options, default or "")
             return options, value
         except Exception:
             log.exception("Failed to list photometry dirs")
@@ -401,52 +501,122 @@ def create_app(cfg: ReviewConfig) -> Dash:
     @callback(
         Output("target-select", "options"),
         Output("target-select", "value"),
+        Output("plot-load-token", "data"),
         Input("event-select", "value"),
         Input("workspace-select", "value"),
         Input("photometry-select", "value"),
-        Input("reload-btn", "n_clicks"),
-        State("target-select", "value"),
+        Input("target-select", "value"),
+        State("plot-load-token", "data"),
     )
     def update_target_options(
-        event: str, workspace: str | None, _lc_dir: str | None, _n: int, current_target: str | None
+        event: str,
+        workspace: str | None,
+        _lc_dir: str | None,
+        target: str | None,
+        token: int | None,
     ):
         if not workspace:
-            return [], cfg.default_lc
+            return [], cfg.default_lc, token or 0
         try:
-            labels = parse_diff_config(cfg.event_dir(event) / workspace / "diff_config.yaml")
-            options = [
-                {"label": name, "value": name}
-                for name, _fname in list_lightcurve_options(labels)
-            ]
-            value = _pick_dropdown_value(current_target, options, cfg.default_lc)
-            return options, value
+            options, default = _target_options(cfg, event, workspace)
+            value = _pick_dropdown_value(target, options, default)
+            next_token = (token or 0) + 1
+            return options, value, next_token
         except Exception:
             log.exception("Failed to list targets")
-            return [], cfg.default_lc
+            return [], cfg.default_lc, token or 0
+
+    @callback(
+        Output("event-select", "options"),
+        Output("event-select", "value"),
+        Output("workspace-select", "options", allow_duplicate=True),
+        Output("workspace-select", "value", allow_duplicate=True),
+        Output("photometry-select", "options", allow_duplicate=True),
+        Output("photometry-select", "value", allow_duplicate=True),
+        Output("target-select", "options", allow_duplicate=True),
+        Output("target-select", "value", allow_duplicate=True),
+        Input("reload-btn", "n_clicks"),
+        State("event-select", "value"),
+        State("workspace-select", "value"),
+        State("photometry-select", "value"),
+        State("target-select", "value"),
+        prevent_initial_call=True,
+    )
+    def refresh_lists(
+        _n: int,
+        cur_event: str | None,
+        cur_ws: str | None,
+        cur_lc: str | None,
+        cur_target: str | None,
+    ):
+        clear_index_cache()
+        clear_tessreduce_cache()
+        clear_store_payload_cache()
+        try:
+            if cfg.sync_on_start and cur_event:
+                sync_event_metadata(cfg.source_mount_expanded, cfg.cache_root_expanded, cur_event)
+            event_labels = _list_event_labels(cfg)
+            event_options = [{"label": e, "value": e} for e in event_labels]
+            event = _pick_dropdown_value(cur_event, event_options, cfg.default_event)
+
+            ws_options, _ = _workspace_options(cfg, event)
+            workspace = _pick_dropdown_value(cur_ws, ws_options, cfg.default_workspace)
+
+            phot_options, phot_default = _photometry_options(cfg, event, workspace)
+            lc_dir = _pick_dropdown_value(cur_lc, phot_options, phot_default or "")
+
+            tgt_options, tgt_default = _target_options(cfg, event, workspace)
+            target = _pick_dropdown_value(cur_target, tgt_options, tgt_default)
+
+            return (
+                event_options,
+                event,
+                ws_options,
+                workspace,
+                phot_options,
+                lc_dir if phot_options else None,
+                tgt_options,
+                target,
+            )
+        except Exception:
+            log.exception("Failed to refresh lists")
+            return (no_update,) * 8
 
     @callback(
         Output("event-index-store", "data"),
         Output("mount-status", "children"),
         Output("mount-status", "style"),
-        Input("event-select", "value"),
-        Input("workspace-select", "value"),
-        Input("photometry-select", "value"),
-        Input("target-select", "value"),
-        Input("reload-btn", "n_clicks"),
+        Input("plot-load-token", "data"),
+        State("event-select", "value"),
+        State("workspace-select", "value"),
+        State("photometry-select", "value"),
+        State("target-select", "value"),
     )
-    def load_index(event: str, workspace: str | None, lc_dir: str | None, target: str, _n: int):
+    def load_index(
+        _token: int,
+        event: str,
+        workspace: str | None,
+        lc_dir: str | None,
+        target: str,
+    ):
         if not workspace or not lc_dir:
             return None, "Select event, workspace, and photometry", {"color": "#c62828", "fontWeight": "bold"}
-        if cfg.sync_on_start and ctx.triggered_id == "reload-btn":
-            sync_workspace_metadata(cfg.source_mount_expanded, cfg.cache_root_expanded)
-        ok, msg = is_healthy(
-            cfg.data_mount_expanded,
-            event,
-            workspace_subdir=workspace,
-            lc_dir=lc_dir,
-            metadata_root=cfg.data_mount_expanded,
-            fits_root=cfg.source_mount_expanded,
-        )
+        cache_key = _store_payload_key(event, workspace, lc_dir, target)
+        cached_payload = _store_payload_cache.get(cache_key)
+        if cached_payload is not None:
+            return cached_payload
+        fits_event = cfg.source_event_dir(event)
+        if master_index_is_cached(fits_event, workspace):
+            ok, msg = True, f"OK: {event}/{workspace}/{lc_dir}"
+        else:
+            ok, msg = is_healthy(
+                cfg.data_mount_expanded,
+                event,
+                workspace_subdir=workspace,
+                lc_dir=lc_dir,
+                metadata_root=cfg.data_mount_expanded,
+                fits_root=cfg.source_mount_expanded,
+            )
         style = {"color": "#2e7d32" if ok else "#c62828", "fontWeight": "bold"}
         try:
             idx = EventIndex.load(
@@ -454,7 +624,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
                 workspace_subdir=workspace,
                 lc_dir=lc_dir,
                 lc_name=target,
-                fits_event_dir=cfg.source_event_dir(event),
+                fits_event_dir=fits_event,
             )
             tess = load_tessreduce_for_event(event, cfg.tessreduce_root_expanded)
             store = {
@@ -464,12 +634,14 @@ def create_app(cfg: ReviewConfig) -> Dash:
                 "lc_name": target,
                 "epochs": idx.epochs.to_dict(orient="list"),
                 "regions_path": str(idx.regions_path) if idx.regions_path.is_file() else None,
-                "fits_event_dir": str(cfg.source_event_dir(event)),
+                "fits_event_dir": str(fits_event),
                 "crop_bounds": idx.crop_bounds,
                 "tessreduce": tessreduce_store_payload(tess),
                 **idx.kernel_workspace_paths(),
             }
-            return store, msg, style
+            result: _StorePayload = (store, msg, style)
+            _store_payload_cache[cache_key] = result
+            return result
         except Exception as exc:
             return None, f"Load failed: {exc}", style
 
@@ -478,8 +650,16 @@ def create_app(cfg: ReviewConfig) -> Dash:
         Input("event-index-store", "data"),
         prevent_initial_call=True,
     )
-    def clear_epoch_on_reload(_store: dict | None):
+    def clear_epoch_on_store_change(_store: dict | None):
         return None
+
+    @callback(
+        Output("product-id-search-status", "children", allow_duplicate=True),
+        Input("event-index-store", "data"),
+        prevent_initial_call=True,
+    )
+    def clear_product_id_search_status(_store: dict | None):
+        return ""
 
     app.clientside_callback(
         """
@@ -771,6 +951,25 @@ def create_app(cfg: ReviewConfig) -> Dash:
         return fig
 
     @callback(
+        Output("selected-epoch", "data", allow_duplicate=True),
+        Output("product-id-search-status", "children"),
+        Output("product-id-search-status", "style"),
+        Input("product-id-select-btn", "n_clicks"),
+        Input("product-id-search", "n_submit"),
+        State("product-id-search", "value"),
+        State("event-index-store", "data"),
+        prevent_initial_call=True,
+    )
+    def select_epoch_by_product_id(
+        _n_clicks: int, _n_submit: int, query: str | None, store: dict | None
+    ):
+        epoch_idx, message = find_epoch_idx_by_product_id((store or {}).get("epochs") or {}, query)
+        if epoch_idx is None:
+            return no_update, message, {"fontSize": "12px", "color": "#c62828"}
+        note = message or "Epoch selected."
+        return epoch_idx, note, {"fontSize": "12px", "color": "#2e7d32"}
+
+    @callback(
         Output("epoch-meta", "children"),
         Input("event-index-store", "data"),
         Input("selected-epoch", "data"),
@@ -783,13 +982,41 @@ def create_app(cfg: ReviewConfig) -> Dash:
         if row.empty:
             return "Epoch not found."
         r = row.iloc[0]
+        product_id = r.get("product_id")
+        product_id_text = str(product_id) if product_id else "—"
+        product_id_row: list[Any] = [html.Span("product_id: ")]
+        if product_id:
+            product_id_row.extend(
+                [
+                    html.Code(
+                        product_id_text,
+                        id="epoch-product-id",
+                        style={"fontSize": "12px"},
+                    ),
+                    dcc.Clipboard(
+                        target_id="epoch-product-id",
+                        title="Copy product ID",
+                        style={
+                            "display": "inline-block",
+                            "marginLeft": "6px",
+                            "cursor": "pointer",
+                            "fontSize": "12px",
+                        },
+                    ),
+                ]
+            )
+        else:
+            product_id_row.append(html.Span("—"))
         return html.Div(
             [
                 html.Div(f"epoch_idx: {int(r['epoch_idx'])}"),
                 html.Div(f"BTJD: {r['btjd']:.6f}"),
                 html.Div(f"flux: {r['flux']:.6g} ± {r['eflux']:.6g}"),
                 html.Div(f"SNR: {r['snr']:.2f}" if pd.notna(r["snr"]) else "SNR: —"),
-                html.Div(f"product_id: {r.get('product_id') or '—'}"),
+                html.Div(
+                    product_id_row,
+                    style={"display": "flex", "alignItems": "center", "flexWrap": "wrap", "gap": "4px"},
+                ),
                 html.Div(f"group_id: {r.get('group_id') if pd.notna(r.get('group_id')) else '—'}"),
                 html.Div(f"hotpants_ok: {r.get('hotpants_ok')}"),
             ]

@@ -6,6 +6,7 @@ import pytest
 from review.tessreduce import (
     MJD_TO_BTJD_OFFSET,
     TessreduceLightCurve,
+    clear_tessreduce_cache,
     load_tessreduce_for_event,
     parse_event_label,
     tessreduce_csv_path,
@@ -56,6 +57,16 @@ def test_tessreduce_store_payload_empty():
     )
     assert payload["available"] is False
     assert payload["btjd"] == []
+
+
+def test_tessreduce_load_is_memoized(tmp_path: Path):
+    clear_tessreduce_cache()
+    csv = tmp_path / "0004_SN2020ftl_s23_tessreduce.csv"
+    csv.write_text("time,flux,flux_err\n58927.62,10.0,1.0\n")
+    first = load_tessreduce_for_event("s0023_c1_k3_2020ftl", tmp_path)
+    second = load_tessreduce_for_event("s0023_c1_k3_2020ftl", tmp_path)
+    assert first is second
+    clear_tessreduce_cache()
 
 
 @pytest.mark.integration

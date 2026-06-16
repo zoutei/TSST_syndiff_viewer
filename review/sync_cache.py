@@ -89,13 +89,44 @@ def _copy_file(src: Path, dst: Path) -> str | None:
         return f"{src} -> {dst}: {exc}"
 
 
-def sync_workspace_metadata(source_root: Path, cache_root: Path) -> SyncResult:
-    """Copy metadata files from *source_root* to *cache_root*, skipping unchanged mtimes."""
-    source = source_root.resolve()
-    cache = cache_root.resolve()
-    result = SyncResult()
+def discover_event_metadata_files(source_root: Path, event_label: str) -> list[Path]:
+    """Return metadata paths for a single event under *source_root*."""
+    root = source_root.resolve()
+    event_dir = root / "events" / event_label
+    if not event_dir.is_dir():
+        return []
 
-    for src in discover_metadata_files(source):
+    files: list[Path] = []
+    manifest = event_dir / DEFAULT_MANIFEST_BASENAME
+    if manifest.is_file():
+        files.append(manifest)
+
+    cluster_job = event_dir / CLUSTER_TEMPLATE_JOB_BASENAME
+    if cluster_job.is_file():
+        files.append(cluster_job)
+
+    for ws_name in list_workspaces(event_dir):
+        ws_dir = event_dir / ws_name
+        diff_cfg = ws_dir / "diff_config.yaml"
+        if diff_cfg.is_file():
+            files.append(diff_cfg)
+        targets_reg = ws_dir / TARGETS_DS9_REGION_BASENAME
+        if targets_reg.is_file():
+            files.append(targets_reg)
+        for csv_path in sorted(ws_dir.glob(f"**/{CONVOLVED_TEMPLATES_CSV_BASENAME}")):
+            if csv_path.is_file():
+                files.append(csv_path)
+        for lc_name in list_photometry_dirs(ws_dir):
+            lc_dir = ws_dir / lc_name
+            for csv_path in sorted(lc_dir.glob("*.csv")):
+                if csv_path.is_file():
+                    files.append(csv_path)
+    return files
+
+
+def _sync_files(source: Path, cache: Path, files: list[Path]) -> SyncResult:
+    result = SyncResult()
+    for src in files:
         rel = src.relative_to(source)
         dst = cache / rel
         if not needs_update(src, dst):
@@ -107,6 +138,31 @@ def sync_workspace_metadata(source_root: Path, cache_root: Path) -> SyncResult:
             log.warning("Cache sync failed: %s", err)
         else:
             result.copied += 1
+    return result
+
+
+def sync_event_metadata(source_root: Path, cache_root: Path, event_label: str) -> SyncResult:
+    """Copy metadata for one event from NFS source to cache."""
+    source = source_root.resolve()
+    cache = cache_root.resolve()
+    files = discover_event_metadata_files(source, event_label)
+    result = _sync_files(source, cache, files)
+    log.info(
+        "Cache sync (%s): %d copied, %d skipped (up to date)%s",
+        event_label,
+        result.copied,
+        result.skipped,
+        f", {len(result.errors)} errors" if result.errors else "",
+    )
+    return result
+
+
+def sync_workspace_metadata(source_root: Path, cache_root: Path) -> SyncResult:
+    """Copy metadata files from *source_root* to *cache_root*, skipping unchanged mtimes."""
+    source = source_root.resolve()
+    cache = cache_root.resolve()
+    files = discover_metadata_files(source)
+    result = _sync_files(source, cache, files)
 
     log.info(
         "Cache sync: %d copied, %d skipped (up to date)%s",

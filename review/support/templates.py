@@ -105,18 +105,43 @@ def lookup_convolved_template(
     tol: float = 1e-3,
 ) -> Path | None:
     """Return convolved template path for manifest group offsets via CSV manifest."""
-    csv_path = conv_dir / "convolved_templates.csv"
-    if not csv_path.is_file():
-        return None
-    table = pd.read_csv(csv_path)
-    for _, row in table.iterrows():
-        if abs(float(row["group_dx"]) - group_dx) <= tol and abs(
-            float(row["group_dy"]) - group_dy
-        ) <= tol:
+    return ConvTemplateIndex.from_dir(conv_dir, tol=tol).lookup(group_dx, group_dy)
+
+
+@dataclass
+class ConvTemplateIndex:
+    """In-memory index of ``convolved_templates.csv`` keyed by rounded (dx, dy)."""
+
+    _by_offset: dict[tuple[float, float], Path]
+    _tol: float = 1e-3
+
+    @classmethod
+    def from_dir(cls, conv_dir: Path | None, *, tol: float = 1e-3) -> ConvTemplateIndex:
+        if conv_dir is None:
+            return cls(_by_offset={}, _tol=tol)
+        csv_path = Path(conv_dir) / "convolved_templates.csv"
+        if not csv_path.is_file():
+            return cls(_by_offset={}, _tol=tol)
+        by_offset: dict[tuple[float, float], Path] = {}
+        table = pd.read_csv(csv_path)
+        for _, row in table.iterrows():
+            key = (round(float(row["group_dx"]), 6), round(float(row["group_dy"]), 6))
+            if key in by_offset:
+                continue
             p = Path(str(row["convolved_path"]))
             if p.is_file():
-                return p
-    return None
+                by_offset[key] = p
+        return cls(_by_offset=by_offset, _tol=tol)
+
+    def lookup(self, group_dx: float, group_dy: float) -> Path | None:
+        key = (round(float(group_dx), 6), round(float(group_dy), 6))
+        hit = self._by_offset.get(key)
+        if hit is not None:
+            return hit
+        for (dx, dy), path in self._by_offset.items():
+            if abs(dx - group_dx) <= self._tol and abs(dy - group_dy) <= self._tol:
+                return path
+        return None
 
 
 def parse_crop_bounds_from_targets_reg(ws_dir: Path) -> dict | None:

@@ -9,6 +9,7 @@ from astropy.io import fits
 from review.crop_cache import ensure_cropped_fits
 from review.pipeline_labels import list_lightcurve_options, parse_diff_config
 from review.support.templates import (
+    ConvTemplateIndex,
     find_template_by_offset,
     lookup_convolved_template,
     parse_crop_bounds_from_targets_reg,
@@ -73,6 +74,37 @@ def test_lookup_convolved_template(tmp_path):
     table.to_csv(conv_dir / "convolved_templates.csv", index=False)
     hit = lookup_convolved_template(conv_dir, 0.0, 0.01)
     assert hit == conv_path
+
+
+def test_conv_template_index_reuses_csv(tmp_path, monkeypatch):
+    conv_dir = tmp_path / "tmpl_conv"
+    conv_dir.mkdir()
+    conv_path = conv_dir / "convolved_template_dx0.000_dy0.010.fits"
+    conv_path.write_bytes(b"SIMPLE  =                    T")
+    table = pd.DataFrame(
+        [
+            {
+                "group_id": 0,
+                "group_dx": 0.0,
+                "group_dy": 0.01,
+                "template_path": "/data/tmpl.fits",
+                "convolved_path": str(conv_path),
+            }
+        ]
+    )
+    table.to_csv(conv_dir / "convolved_templates.csv", index=False)
+    read_calls = {"n": 0}
+    real_read_csv = pd.read_csv
+
+    def counting_read_csv(*args, **kwargs):
+        read_calls["n"] += 1
+        return real_read_csv(*args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_csv", counting_read_csv)
+    index = ConvTemplateIndex.from_dir(conv_dir)
+    assert index.lookup(0.0, 0.01) == conv_path
+    assert index.lookup(0.0, 0.01) == conv_path
+    assert read_calls["n"] == 1
 
 
 def test_parse_crop_bounds_from_targets_reg(tmp_path):
