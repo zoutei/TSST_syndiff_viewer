@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from tqdm import tqdm
 
 from review.mount import list_events, list_photometry_dirs, list_workspaces
 from review.support.paths import DEFAULT_MANIFEST_BASENAME, TARGETS_DS9_REGION_BASENAME
@@ -27,6 +30,12 @@ class SyncResult:
     errors: list[str] = field(default_factory=list)
 
 
+def _use_progress(progress: bool | None) -> bool:
+    if progress is None:
+        return sys.stderr.isatty()
+    return progress
+
+
 def resolve_cache_root(cache_root: str | Path | None = None) -> Path:
     if cache_root is None:
         return DEFAULT_CACHE_ROOT
@@ -43,7 +52,7 @@ def needs_update(src: Path, dst: Path) -> bool:
         return True
 
 
-def discover_metadata_files(source_root: Path) -> list[Path]:
+def discover_metadata_files(source_root: Path, *, progress: bool | None = None) -> list[Path]:
     """Return metadata file paths under *source_root* (CSVs, YAML, REG; no FITS)."""
     root = source_root.resolve()
     events_dir = root / "events"
@@ -51,7 +60,15 @@ def discover_metadata_files(source_root: Path) -> list[Path]:
         return []
 
     files: list[Path] = []
-    for event_label in list_events(root):
+    event_labels = list_events(root)
+    event_iter = tqdm(
+        event_labels,
+        desc="Discovering metadata",
+        unit="event",
+        disable=not _use_progress(progress),
+        leave=False,
+    )
+    for event_label in event_iter:
         event_dir = events_dir / event_label
         manifest = event_dir / DEFAULT_MANIFEST_BASENAME
         if manifest.is_file():
@@ -124,13 +141,26 @@ def discover_event_metadata_files(source_root: Path, event_label: str) -> list[P
     return files
 
 
-def _sync_files(source: Path, cache: Path, files: list[Path]) -> SyncResult:
+def _sync_files(
+    source: Path,
+    cache: Path,
+    files: list[Path],
+    *,
+    progress: bool | None = None,
+) -> SyncResult:
     result = SyncResult()
-    for src in files:
+    file_iter = tqdm(
+        files,
+        desc="Syncing cache",
+        unit="file",
+        disable=not _use_progress(progress),
+    )
+    for src in file_iter:
         rel = src.relative_to(source)
         dst = cache / rel
         if not needs_update(src, dst):
             result.skipped += 1
+            file_iter.set_postfix(copied=result.copied, skipped=result.skipped, refresh=False)
             continue
         err = _copy_file(src, dst)
         if err:
@@ -138,15 +168,22 @@ def _sync_files(source: Path, cache: Path, files: list[Path]) -> SyncResult:
             log.warning("Cache sync failed: %s", err)
         else:
             result.copied += 1
+        file_iter.set_postfix(copied=result.copied, skipped=result.skipped, refresh=False)
     return result
 
 
-def sync_event_metadata(source_root: Path, cache_root: Path, event_label: str) -> SyncResult:
+def sync_event_metadata(
+    source_root: Path,
+    cache_root: Path,
+    event_label: str,
+    *,
+    progress: bool | None = None,
+) -> SyncResult:
     """Copy metadata for one event from NFS source to cache."""
     source = source_root.resolve()
     cache = cache_root.resolve()
     files = discover_event_metadata_files(source, event_label)
-    result = _sync_files(source, cache, files)
+    result = _sync_files(source, cache, files, progress=progress)
     log.info(
         "Cache sync (%s): %d copied, %d skipped (up to date)%s",
         event_label,
@@ -157,12 +194,17 @@ def sync_event_metadata(source_root: Path, cache_root: Path, event_label: str) -
     return result
 
 
-def sync_workspace_metadata(source_root: Path, cache_root: Path) -> SyncResult:
+def sync_workspace_metadata(
+    source_root: Path,
+    cache_root: Path,
+    *,
+    progress: bool | None = None,
+) -> SyncResult:
     """Copy metadata files from *source_root* to *cache_root*, skipping unchanged mtimes."""
     source = source_root.resolve()
     cache = cache_root.resolve()
-    files = discover_metadata_files(source)
-    result = _sync_files(source, cache, files)
+    files = discover_metadata_files(source, progress=progress)
+    result = _sync_files(source, cache, files, progress=progress)
 
     log.info(
         "Cache sync: %d copied, %d skipped (up to date)%s",
