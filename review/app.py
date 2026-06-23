@@ -18,6 +18,7 @@ from .ds9 import Ds9Controller
 from .event_index import EventIndex, clear_index_cache, master_index_is_cached
 from .mount import is_healthy, list_events, list_photometry_dirs, list_workspaces
 from .pipeline_labels import list_lightcurve_selections, parse_diff_config
+from .plot_lc import PRIMARY_MARKER, add_syndiff_traces, add_tessreduce_traces
 from .smoothing import SmoothingMode, apply_smoothing
 from .sync_cache import sync_event_metadata, sync_workspace_metadata
 from .tessreduce import clear_tessreduce_cache, load_tessreduce_for_event, tessreduce_store_payload
@@ -89,33 +90,6 @@ def find_epoch_idx_by_product_id(epochs: dict[str, list] | pd.DataFrame, query: 
     if len(contains) > 1:
         return int(contains.iloc[0]["epoch_idx"]), f"{len(contains)} matches; selected first."
     return None, f"No epoch with product_id matching {query!r}."
-
-
-def _legend_only_scatter(
-    name: str,
-    *,
-    mode: str = "markers",
-    marker: dict | None = None,
-    line: dict | None = None,
-) -> go.Scatter:
-    return go.Scatter(
-        x=[None],
-        y=[None],
-        mode=mode,
-        name=name,
-        marker=marker,
-        line=line,
-        visible="legendonly",
-        showlegend=True,
-    )
-
-
-_LC_POINT_SIZE = 7
-_SYNDIFF_MARKER = dict(size=_LC_POINT_SIZE, color="steelblue")
-_SELECTED_MARKER = dict(size=12, color="black", symbol="circle-open", line_width=2)
-_TESS_RAW_MARKER = dict(size=_LC_POINT_SIZE, color="#6a1b9a", opacity=0.65)
-_TESS_BINNED_MARKER = dict(size=10, symbol="diamond", color="#26a69a")
-_TESS_SG_LINE = dict(color="#ec407a", width=2)
 
 
 def _ds9_button_grid(buttons: list[tuple[str, str]]) -> html.Div:
@@ -709,7 +683,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
                     if (points.length > 0) {
                         const custom = points[0].customdata;
                         if (custom !== undefined && custom !== null) {
-                            epoch = custom;
+                            epoch = Array.isArray(custom) ? custom[1] : custom;
                         }
                     }
                     window.dash_clientside.set_props("selected-epoch", {data: epoch});
@@ -824,76 +798,22 @@ def create_app(cfg: ReviewConfig) -> Dash:
 
         fig = go.Figure()
         show_errorbars = "show" in (show_errorbars_vals or [])
-        syndiff_yerr = df["eflux"].where(df["eflux"].notna(), None) if show_errorbars else None
-        fig.add_trace(
-            go.Scatter(
-                x=df["btjd"],
-                y=df["flux"],
-                error_y=dict(type="data", array=syndiff_yerr, visible=show_errorbars),
-                mode="markers",
-                name="Syndiff",
-                marker=_SYNDIFF_MARKER,
-                customdata=df["epoch_idx"].tolist(),
-            )
+        add_syndiff_traces(
+            fig,
+            df,
+            layer_key="primary",
+            name="Syndiff",
+            marker=PRIMARY_MARKER,
+            show_errorbars=show_errorbars,
+            smooth=smooth,
+            mode=mode,
+            selected_epoch=selected_epoch,
+            show_diagnostics=True,
         )
-
-        if mode == "binned" and smooth.binned_t.size:
-            fig.add_trace(
-                go.Scatter(
-                    x=smooth.binned_t,
-                    y=smooth.binned_flux,
-                    mode="markers",
-                    name="binned σ-clip",
-                    marker=dict(size=10, symbol="diamond", color="darkorange"),
-                )
-            )
-            rejected = df.loc[~smooth.clip_keep_mask]
-            if not rejected.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=rejected["btjd"],
-                        y=rejected["flux"],
-                        mode="markers",
-                        name="rejected",
-                        marker=dict(size=7, symbol="x", color="crimson"),
-                        customdata=rejected["epoch_idx"].tolist(),
-                    )
-                )
-        elif mode == "savgol":
-            fig.add_trace(
-                go.Scatter(
-                    x=df["btjd"],
-                    y=smooth.savgol_flux,
-                    mode="lines",
-                    name="Savitzky-Golay",
-                    line=dict(color="darkorange", width=2),
-                )
-            )
-
-        for start in smooth.segment_starts[1:]:
-            if 0 <= start < len(df):
-                fig.add_vline(x=float(df.iloc[start]["btjd"]), line_dash="dot", line_color="#888")
-
-        if selected_epoch is not None:
-            sel = df.loc[df["epoch_idx"] == selected_epoch]
-            if not sel.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=sel["btjd"],
-                        y=sel["flux"],
-                        mode="markers",
-                        name="selected",
-                        marker=_SELECTED_MARKER,
-                    )
-                )
-            else:
-                fig.add_trace(_legend_only_scatter("selected", marker=_SELECTED_MARKER))
-        else:
-            fig.add_trace(_legend_only_scatter("selected", marker=_SELECTED_MARKER))
 
         tess = store.get("tessreduce") or {}
         tess_available = bool(tess.get("available") and tess.get("btjd"))
-        if tess_available and show_tessreduce:
+        if tess_available:
             tr_btjd = tess["btjd"]
             offset = _parse_flux_offset(tessreduce_flux_offset)
             tr_flux = [float(f) + offset for f in tess["flux"]]
@@ -909,63 +829,16 @@ def create_app(cfg: ReviewConfig) -> Dash:
                 savgol_window=int(sg_window),
                 savgol_polyorder=int(sg_poly),
             )
-            tess_yerr = tr_eflux if show_errorbars and tr_eflux else None
-            fig.add_trace(
-                go.Scatter(
-                    x=tr_btjd,
-                    y=tr_flux,
-                    error_y=dict(
-                        type="data",
-                        array=tess_yerr,
-                        visible=show_errorbars and bool(tr_eflux),
-                    ),
-                    mode="markers",
-                    name="TESSreduce",
-                    marker=_TESS_RAW_MARKER,
-                )
+            add_tessreduce_traces(
+                fig,
+                btjd=tr_btjd,
+                flux=tr_flux,
+                eflux=tr_eflux,
+                show_errorbars=show_errorbars,
+                smooth=tr_smooth,
+                mode=mode,
+                visible=bool(show_tessreduce),
             )
-            if mode == "binned" and tr_smooth.binned_t.size:
-                fig.add_trace(
-                    go.Scatter(
-                        x=tr_smooth.binned_t,
-                        y=tr_smooth.binned_flux,
-                        mode="markers",
-                        name="TESSreduce binned",
-                        marker=_TESS_BINNED_MARKER,
-                    )
-                )
-            elif mode == "savgol":
-                fig.add_trace(
-                    go.Scatter(
-                        x=tr_btjd,
-                        y=tr_smooth.savgol_flux,
-                        mode="lines",
-                        name="TESSreduce SG",
-                        line=_TESS_SG_LINE,
-                    )
-                )
-        elif tess_available:
-            fig.add_trace(
-                _legend_only_scatter(
-                    "TESSreduce",
-                    marker=_TESS_RAW_MARKER,
-                )
-            )
-            if mode == "binned":
-                fig.add_trace(
-                    _legend_only_scatter(
-                        "TESSreduce binned",
-                        marker=_TESS_BINNED_MARKER,
-                    )
-                )
-            elif mode == "savgol":
-                fig.add_trace(
-                    _legend_only_scatter(
-                        "TESSreduce SG",
-                        mode="lines",
-                        line=_TESS_SG_LINE,
-                    )
-                )
 
         fig.update_layout(
             margin=dict(l=40, r=20, t=50, b=40),
