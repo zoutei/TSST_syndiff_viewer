@@ -11,14 +11,37 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from dash import ALL, Dash, Input, Output, State, callback, ctx, dcc, html, no_update
+from dash.exceptions import PreventUpdate
 
 from .config import ReviewConfig
 from .crop_cache import ensure_cropped_fits
 from .ds9 import Ds9Controller
 from .event_index import EventIndex, clear_index_cache, master_index_is_cached
 from .mount import is_healthy, list_events, list_photometry_dirs, list_workspaces
+from .overlay_layers import (
+    PRIMARY_LAYER_KEY,
+    active_layer_display_label,
+    append_layer_if_new,
+    can_add_layer,
+    layer_is_visible_for_plot,
+    layer_label,
+    load_layer_index_payload,
+    point_from_plot_click,
+    primary_identity_from_store,
+    remove_layer,
+    resolve_active_context,
+    set_layer_offset,
+)
 from .pipeline_labels import list_lightcurve_selections, parse_diff_config
-from .plot_lc import PRIMARY_MARKER, add_syndiff_traces, add_tessreduce_traces
+from .overlay_layers import build_layer_store
+from .plot_lc import (
+    ACTIVE_PRIMARY_MARKER,
+    OVERLAY_COLORS,
+    PRIMARY_MARKER,
+    add_syndiff_traces,
+    add_tessreduce_traces,
+    overlay_marker,
+)
 from .smoothing import SmoothingMode, apply_smoothing
 from .sync_cache import sync_event_metadata, sync_workspace_metadata
 from .tessreduce import clear_tessreduce_cache, load_tessreduce_for_event, tessreduce_store_payload
@@ -54,12 +77,10 @@ def _pick_dropdown_value(current: str | None, options: list[dict[str, str]], def
 
 
 def _epoch_from_plot_click(click_data: dict | None) -> int | None:
-    """Return epoch_idx when a flux marker is clicked; otherwise deselect."""
-    if not click_data or not click_data.get("points"):
-        return None
-    custom = click_data["points"][0].get("customdata")
-    if custom is not None:
-        return int(custom)
+    """Return epoch_idx for primary-layer clicks (legacy helper for tests)."""
+    point = point_from_plot_click(click_data)
+    if point and point.get("layer") == PRIMARY_LAYER_KEY:
+        return int(point["epoch_idx"])
     return None
 
 
@@ -214,6 +235,12 @@ def create_app(cfg: ReviewConfig) -> Dash:
                                     placeholder="Target",
                                     style={"width": "200px"},
                                 ),
+                                html.Button(
+                                    "Add to compare",
+                                    id="add-to-compare-btn",
+                                    n_clicks=0,
+                                    title="Add the current top-bar selection as a compare layer",
+                                ),
                             ],
                             style={"display": "flex", "gap": "12px", "alignItems": "center", "flexWrap": "wrap"},
                         ),
@@ -263,6 +290,18 @@ def create_app(cfg: ReviewConfig) -> Dash:
             if not mount_ok
             else html.Div(),
             html.Div(
+                id="compare-strip",
+                style={
+                    "display": "flex",
+                    "flexWrap": "wrap",
+                    "gap": "8px",
+                    "alignItems": "center",
+                    "padding": "8px 12px",
+                    "borderBottom": "1px solid #eee",
+                    "background": "#fafafa",
+                },
+            ),
+            html.Div(
                 [
                     html.Div(
                         [dcc.Graph(id="lc-plot", style={"height": "72vh"})],
@@ -270,7 +309,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
                     ),
                     html.Div(
                         [
-                            html.H4("Epoch"),
+                            html.H4(id="epoch-header", children="Epoch"),
                             html.Div(
                                 [
                                     html.Label("Product ID", style={"fontSize": "13px"}),
@@ -458,9 +497,12 @@ def create_app(cfg: ReviewConfig) -> Dash:
                 },
             ),
             dcc.Store(id="event-index-store"),
-            dcc.Store(id="selected-epoch", data=None),
+            dcc.Store(id="selected-point-store", data=None),
             dcc.Store(id="plot-click-listener", data=None),
             dcc.Store(id="plot-load-token", data=0),
+            dcc.Store(id="overlay-layers-store", data=[]),
+            dcc.Store(id="layer-index-store", data={}),
+            dcc.Store(id="active-layer-store", data=PRIMARY_LAYER_KEY),
         ],
         style={"fontFamily": "system-ui, sans-serif"},
     )
@@ -566,7 +608,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
             lc_dir = _pick_dropdown_value(cur_lc, phot_options, phot_default or "")
 
             tgt_options, tgt_default = _target_options(cfg, event, workspace, lc_dir)
-            target = _pick_dropdown_value(cur_target, tgt_options, tgt_default)
+            target = _pick_dropdown_value(cur_target, tgt_options, tgt_default or cfg.default_lc)
 
             return (
                 event_options,
@@ -576,7 +618,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
                 phot_options,
                 lc_dir if phot_options else None,
                 tgt_options,
-                target,
+                target if tgt_options else cfg.default_lc,
             )
         except Exception:
             log.exception("Failed to refresh lists")
@@ -631,16 +673,15 @@ def create_app(cfg: ReviewConfig) -> Dash:
             )
             tess = load_tessreduce_for_event(event, cfg.tessreduce_root_expanded)
             store = {
-                "event": event,
-                "workspace": workspace,
-                "lc_dir": lc_dir,
-                "lc_name": target,
-                "epochs": idx.epochs.to_dict(orient="list"),
-                "regions_path": str(idx.regions_path) if idx.regions_path.is_file() else None,
-                "fits_event_dir": str(fits_event),
-                "crop_bounds": idx.crop_bounds,
+                **build_layer_store(
+                    idx,
+                    event=event,
+                    workspace=workspace,
+                    lc_dir=lc_dir,
+                    lc_name=target,
+                    fits_event_dir=str(fits_event),
+                ),
                 "tessreduce": tessreduce_store_payload(tess),
-                **idx.kernel_workspace_paths(),
             }
             result: _StorePayload = (store, msg, style)
             _store_payload_cache[cache_key] = result
@@ -648,12 +689,247 @@ def create_app(cfg: ReviewConfig) -> Dash:
         except Exception as exc:
             return None, f"Load failed: {exc}", style
 
+    def _render_compare_strip(
+        layers: list[dict[str, Any]] | None,
+        active_layer: str | None,
+    ) -> list[Any]:
+        layer_list = layers or []
+        active = active_layer or PRIMARY_LAYER_KEY
+        children: list[Any] = [
+            html.Strong(f"Compare ({len(layer_list)})", style={"marginRight": "4px"}),
+        ]
+        if not layer_list:
+            children.append(
+                html.Span(
+                    "Select a curve in the top bar and click Add to compare.",
+                    style={"color": "#757575", "fontSize": "13px"},
+                )
+            )
+        for index, layer in enumerate(layer_list):
+            color = OVERLAY_COLORS[index % len(OVERLAY_COLORS)]
+            label = layer_label(layer)
+            is_active = layer["id"] == active
+            chip_style = {
+                "display": "inline-flex",
+                "alignItems": "center",
+                "gap": "6px",
+                "padding": "4px 8px",
+                "border": "1px solid #ccc",
+                "borderRadius": "16px",
+                "background": "#e3f2fd" if is_active else "white",
+                "fontSize": "13px",
+            }
+            children.append(
+                html.Div(
+                    [
+                        html.Span(
+                            style={
+                                "display": "inline-block",
+                                "width": "10px",
+                                "height": "10px",
+                                "borderRadius": "50%",
+                                "background": color,
+                            }
+                        ),
+                        html.Button(
+                            label,
+                            id={"type": "overlay-chip", "index": layer["id"]},
+                            n_clicks=0,
+                            style={
+                                "border": "none",
+                                "background": "transparent",
+                                "padding": "0",
+                                "cursor": "pointer",
+                                "fontSize": "13px",
+                            },
+                        ),
+                        html.Button(
+                            "×",
+                            id={"type": "overlay-remove", "index": layer["id"]},
+                            n_clicks=0,
+                            title="Remove compare layer",
+                            style={
+                                "border": "none",
+                                "background": "transparent",
+                                "padding": "0 2px",
+                                "cursor": "pointer",
+                                "fontSize": "14px",
+                                "color": "#616161",
+                            },
+                        ),
+                    ],
+                    style=chip_style,
+                )
+            )
+        active_compare = next((layer for layer in layer_list if layer["id"] == active), None)
+        if active_compare is not None:
+            children.extend(
+                [
+                    html.Label("Offset", style={"fontSize": "12px", "marginLeft": "8px"}),
+                    dcc.Input(
+                        id="overlay-selected-offset",
+                        type="number",
+                        value=active_compare.get("flux_offset", 0.0),
+                        step=0.01,
+                        style={"width": "90px"},
+                    ),
+                ]
+            )
+        return children
+
     @callback(
-        Output("selected-epoch", "data"),
+        Output("compare-strip", "children"),
+        Output("add-to-compare-btn", "disabled"),
+        Input("overlay-layers-store", "data"),
+        Input("active-layer-store", "data"),
+    )
+    def render_compare_strip(
+        layers: list[dict[str, Any]] | None,
+        active_layer: str | None,
+    ):
+        layer_list = layers or []
+        return _render_compare_strip(layer_list, active_layer), not can_add_layer(layer_list)
+
+    @callback(
+        Output("overlay-layers-store", "data"),
+        Input("add-to-compare-btn", "n_clicks"),
+        Input({"type": "overlay-remove", "index": ALL}, "n_clicks"),
+        State("overlay-layers-store", "data"),
+        State("workspace-select", "value"),
+        State("photometry-select", "value"),
+        State("target-select", "value"),
+        prevent_initial_call=True,
+    )
+    def manage_overlay_layers(
+        _add_clicks: int,
+        _remove_clicks: list[int | None],
+        layers: list[dict[str, Any]] | None,
+        workspace: str | None,
+        lc_dir: str | None,
+        target: str | None,
+    ):
+        if not ctx.triggered_id:
+            raise PreventUpdate
+        current = list(layers or [])
+        trigger = ctx.triggered_id
+        if trigger == "add-to-compare-btn":
+            if not workspace or not lc_dir or not target:
+                raise PreventUpdate
+            return append_layer_if_new(
+                current,
+                workspace=workspace,
+                lc_dir=lc_dir,
+                lc_name=target,
+            )
+        if isinstance(trigger, dict) and trigger.get("type") == "overlay-remove":
+            layer_id = trigger["index"]
+            if not any(click for click in (_remove_clicks or []) if click):
+                raise PreventUpdate
+            return remove_layer(current, layer_id)
+        raise PreventUpdate
+
+    @callback(
+        Output("active-layer-store", "data"),
+        Input({"type": "overlay-chip", "index": ALL}, "n_clicks"),
+        State("active-layer-store", "data"),
+        State("overlay-layers-store", "data"),
+        prevent_initial_call=True,
+    )
+    def activate_overlay_layer(
+        chip_clicks: list[int | None],
+        active_layer: str | None,
+        layers: list[dict[str, Any]] | None,
+    ):
+        if not ctx.triggered_id or not isinstance(ctx.triggered_id, dict):
+            raise PreventUpdate
+        if not any(click for click in (chip_clicks or []) if click):
+            raise PreventUpdate
+        layer_id = ctx.triggered_id["index"]
+        layer_ids = {layer["id"] for layer in layers or []}
+        if layer_id not in layer_ids:
+            raise PreventUpdate
+        current = active_layer or PRIMARY_LAYER_KEY
+        return PRIMARY_LAYER_KEY if current == layer_id else layer_id
+
+    @callback(
+        Output("overlay-layers-store", "data", allow_duplicate=True),
+        Input("overlay-selected-offset", "value"),
+        State("overlay-layers-store", "data"),
+        State("active-layer-store", "data"),
+        prevent_initial_call=True,
+    )
+    def update_active_layer_offset(
+        offset: float | int | str | None,
+        layers: list[dict[str, Any]] | None,
+        active_layer: str | None,
+    ):
+        if not active_layer or active_layer == PRIMARY_LAYER_KEY:
+            raise PreventUpdate
+        return set_layer_offset(layers, active_layer, _parse_flux_offset(offset))
+
+    @callback(
+        Output("overlay-layers-store", "data", allow_duplicate=True),
+        Output("active-layer-store", "data", allow_duplicate=True),
+        Output("selected-point-store", "data", allow_duplicate=True),
+        Input("event-select", "value"),
+        prevent_initial_call=True,
+    )
+    def clear_overlays_on_event_change(_event: str):
+        return [], PRIMARY_LAYER_KEY, None
+
+    @callback(
+        Output("active-layer-store", "data", allow_duplicate=True),
+        Output("selected-point-store", "data", allow_duplicate=True),
+        Input("plot-load-token", "data"),
+        prevent_initial_call=True,
+    )
+    def reset_active_on_primary_change(_token: int):
+        return PRIMARY_LAYER_KEY, None
+
+    @callback(
+        Output("active-layer-store", "data", allow_duplicate=True),
+        Output("selected-point-store", "data", allow_duplicate=True),
+        Input({"type": "overlay-remove", "index": ALL}, "n_clicks"),
+        State("active-layer-store", "data"),
+        State("overlay-layers-store", "data"),
+        prevent_initial_call=True,
+    )
+    def reset_active_on_layer_remove(
+        _remove_clicks: list[int | None],
+        active_layer: str | None,
+        layers: list[dict[str, Any]] | None,
+    ):
+        if not ctx.triggered_id or not isinstance(ctx.triggered_id, dict):
+            raise PreventUpdate
+        if ctx.triggered_id.get("type") != "overlay-remove":
+            raise PreventUpdate
+        if not any(click for click in (_remove_clicks or []) if click):
+            raise PreventUpdate
+        removed_id = ctx.triggered_id["index"]
+        if active_layer == removed_id:
+            return PRIMARY_LAYER_KEY, None
+        remaining_ids = {layer["id"] for layer in layers or []}
+        if active_layer and active_layer != PRIMARY_LAYER_KEY and active_layer not in remaining_ids:
+            return PRIMARY_LAYER_KEY, None
+        raise PreventUpdate
+
+    @callback(
+        Output("layer-index-store", "data"),
+        Input("overlay-layers-store", "data"),
+        Input("event-select", "value"),
+    )
+    def load_layer_index(
+        layers: list[dict[str, Any]] | None,
+        event: str,
+    ):
+        return load_layer_index_payload(cfg, event, layers)
+
+    @callback(
+        Output("selected-point-store", "data", allow_duplicate=True),
         Input("event-index-store", "data"),
         prevent_initial_call=True,
     )
-    def clear_epoch_on_store_change(_store: dict | None):
+    def clear_point_on_primary_reload(_store: dict | None):
         return None
 
     @callback(
@@ -679,14 +955,20 @@ def create_app(cfg: ReviewConfig) -> Dash:
                 plot.removeAllListeners("plotly_click");
                 plot.on("plotly_click", (evt) => {
                     const points = evt.points || [];
-                    let epoch = null;
+                    let point = null;
                     if (points.length > 0) {
                         const custom = points[0].customdata;
                         if (custom !== undefined && custom !== null) {
-                            epoch = Array.isArray(custom) ? custom[1] : custom;
+                            if (Array.isArray(custom) && custom.length >= 2) {
+                                point = {layer: String(custom[0]), epoch_idx: custom[1]};
+                            } else {
+                                point = {layer: "primary", epoch_idx: custom};
+                            }
                         }
                     }
-                    window.dash_clientside.set_props("selected-epoch", {data: epoch});
+                    const activeLayer = point ? point.layer : "primary";
+                    window.dash_clientside.set_props("active-layer-store", {data: activeLayer});
+                    window.dash_clientside.set_props("selected-point-store", {data: point});
                     window.dash_clientside.set_props("lc-plot", {selectedData: null});
                 });
             };
@@ -756,10 +1038,13 @@ def create_app(cfg: ReviewConfig) -> Dash:
         Input("gap-auto", "value"),
         Input("sg-window", "value"),
         Input("sg-poly", "value"),
-        Input("selected-epoch", "data"),
+        Input("selected-point-store", "data"),
+        Input("active-layer-store", "data"),
         Input("tessreduce-visible", "data"),
         Input("tessreduce-flux-offset", "value"),
         Input("show-errorbars", "value"),
+        Input("overlay-layers-store", "data"),
+        Input("layer-index-store", "data"),
     )
     def update_plot(
         store: dict | None,
@@ -770,10 +1055,13 @@ def create_app(cfg: ReviewConfig) -> Dash:
         gap_auto_vals: list[str],
         sg_window: int,
         sg_poly: int,
-        selected_epoch: int | None,
+        selected_point: dict[str, Any] | None,
+        active_layer: str | None,
         show_tessreduce: bool,
         tessreduce_flux_offset: float | int | str | None,
         show_errorbars_vals: list[str],
+        overlay_layers: list[dict[str, Any]] | None,
+        layer_index_store: dict[str, dict[str, Any]] | None,
     ):
         if not store:
             return go.Figure()
@@ -784,9 +1072,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
 
         mode = _smoothing_mode_from_ui(smooth_mode)
         gap_auto = "auto" in (gap_auto_vals or [])
-        smooth = apply_smoothing(
-            df["btjd"],
-            df["flux"],
+        smooth_kwargs = dict(
             mode=mode,
             bin_width_hours=float(bin_hours),
             bin_sigma=float(bin_sigma),
@@ -795,21 +1081,67 @@ def create_app(cfg: ReviewConfig) -> Dash:
             savgol_window=int(sg_window),
             savgol_polyorder=int(sg_poly),
         )
+        show_errorbars = "show" in (show_errorbars_vals or [])
+        active = active_layer or PRIMARY_LAYER_KEY
+        _, selected_epoch = resolve_active_context(
+            active, store, layer_index_store, selected_point
+        )
 
         fig = go.Figure()
-        show_errorbars = "show" in (show_errorbars_vals or [])
-        add_syndiff_traces(
-            fig,
-            df,
-            layer_key="primary",
-            name="Syndiff",
-            marker=PRIMARY_MARKER,
-            show_errorbars=show_errorbars,
-            smooth=smooth,
-            mode=mode,
-            selected_epoch=selected_epoch,
-            show_diagnostics=True,
-        )
+        primary_identity = primary_identity_from_store(store)
+        entries: list[dict[str, Any]] = [
+            {
+                "key": PRIMARY_LAYER_KEY,
+                "store": store,
+                "name": "Syndiff",
+                "marker": ACTIVE_PRIMARY_MARKER if active == PRIMARY_LAYER_KEY else PRIMARY_MARKER,
+                "flux_offset": 0.0,
+                "color_index": None,
+            }
+        ]
+        overlay_color_index = 0
+        for layer in overlay_layers or []:
+            if not layer_is_visible_for_plot(layer, primary_identity):
+                continue
+            layer_store = (layer_index_store or {}).get(layer["id"]) or {}
+            if layer_store.get("error") or not layer_store.get("epochs"):
+                continue
+            layer_key = layer["id"]
+            entries.append(
+                {
+                    "key": layer_key,
+                    "store": layer_store,
+                    "name": layer_label(layer),
+                    "marker": overlay_marker(overlay_color_index, active=active == layer_key),
+                    "flux_offset": _parse_flux_offset(layer.get("flux_offset")),
+                    "color_index": overlay_color_index,
+                }
+            )
+            overlay_color_index += 1
+
+        entries.sort(key=lambda entry: 1 if entry["key"] == active else 0)
+
+        for entry in entries:
+            layer_df = pd.DataFrame(entry["store"].get("epochs") or {})
+            if layer_df.empty:
+                continue
+            is_active = entry["key"] == active
+            offset = float(entry["flux_offset"])
+            plot_flux = layer_df["flux"] + offset
+            smooth = apply_smoothing(layer_df["btjd"], plot_flux, **smooth_kwargs)
+            add_syndiff_traces(
+                fig,
+                layer_df.assign(flux=plot_flux),
+                layer_key=entry["key"],
+                name=entry["name"],
+                marker=entry["marker"],
+                show_errorbars=show_errorbars,
+                smooth=smooth,
+                mode=mode,
+                selected_epoch=selected_epoch if is_active else None,
+                show_diagnostics=is_active,
+                color_index=entry["color_index"],
+            )
 
         tess = store.get("tessreduce") or {}
         tess_available = bool(tess.get("available") and tess.get("btjd"))
@@ -818,17 +1150,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
             offset = _parse_flux_offset(tessreduce_flux_offset)
             tr_flux = [float(f) + offset for f in tess["flux"]]
             tr_eflux = tess.get("eflux") or []
-            tr_smooth = apply_smoothing(
-                tr_btjd,
-                tr_flux,
-                mode=mode,
-                bin_width_hours=float(bin_hours),
-                bin_sigma=float(bin_sigma),
-                gap_threshold_days=float(gap_threshold),
-                gap_auto=gap_auto,
-                savgol_window=int(sg_window),
-                savgol_polyorder=int(sg_poly),
-            )
+            tr_smooth = apply_smoothing(tr_btjd, tr_flux, **smooth_kwargs)
             add_tessreduce_traces(
                 fig,
                 btjd=tr_btjd,
@@ -853,30 +1175,68 @@ def create_app(cfg: ReviewConfig) -> Dash:
         return fig
 
     @callback(
-        Output("selected-epoch", "data", allow_duplicate=True),
+        Output("selected-point-store", "data", allow_duplicate=True),
+        Output("active-layer-store", "data", allow_duplicate=True),
         Output("product-id-search-status", "children"),
         Output("product-id-search-status", "style"),
         Input("product-id-select-btn", "n_clicks"),
         Input("product-id-search", "n_submit"),
         State("product-id-search", "value"),
         State("event-index-store", "data"),
+        State("layer-index-store", "data"),
+        State("active-layer-store", "data"),
         prevent_initial_call=True,
     )
     def select_epoch_by_product_id(
-        _n_clicks: int, _n_submit: int, query: str | None, store: dict | None
+        _n_clicks: int,
+        _n_submit: int,
+        query: str | None,
+        primary_store: dict | None,
+        layer_index_store: dict[str, dict[str, Any]] | None,
+        active_layer: str | None,
     ):
-        epoch_idx, message = find_epoch_idx_by_product_id((store or {}).get("epochs") or {}, query)
+        active = active_layer or PRIMARY_LAYER_KEY
+        active_store, _ = resolve_active_context(
+            active, primary_store, layer_index_store, None
+        )
+        epochs = (active_store or {}).get("epochs") or {}
+        epoch_idx, message = find_epoch_idx_by_product_id(epochs, query)
         if epoch_idx is None:
-            return no_update, message, {"fontSize": "12px", "color": "#c62828"}
+            return no_update, no_update, message, {"fontSize": "12px", "color": "#c62828"}
         note = message or "Epoch selected."
-        return epoch_idx, note, {"fontSize": "12px", "color": "#2e7d32"}
+        point = {"layer": active, "epoch_idx": epoch_idx}
+        return point, active, note, {"fontSize": "12px", "color": "#2e7d32"}
+
+    @callback(
+        Output("epoch-header", "children"),
+        Input("active-layer-store", "data"),
+        Input("event-index-store", "data"),
+        Input("overlay-layers-store", "data"),
+    )
+    def update_epoch_header(
+        active_layer: str | None,
+        primary_store: dict[str, Any] | None,
+        layers: list[dict[str, Any]] | None,
+    ):
+        label = active_layer_display_label(active_layer or PRIMARY_LAYER_KEY, primary_store, layers)
+        return f"Epoch — {label}"
 
     @callback(
         Output("epoch-meta", "children"),
         Input("event-index-store", "data"),
-        Input("selected-epoch", "data"),
+        Input("layer-index-store", "data"),
+        Input("active-layer-store", "data"),
+        Input("selected-point-store", "data"),
     )
-    def update_sidebar(store: dict | None, epoch_idx: int | None):
+    def update_sidebar(
+        primary_store: dict | None,
+        layer_index_store: dict[str, dict[str, Any]] | None,
+        active_layer: str | None,
+        selected_point: dict[str, Any] | None,
+    ):
+        store, epoch_idx = resolve_active_context(
+            active_layer, primary_store, layer_index_store, selected_point
+        )
         if not store or epoch_idx is None:
             return "Click a Syndiff point to select an epoch."
         df = pd.DataFrame(store["epochs"])
@@ -924,18 +1284,33 @@ def create_app(cfg: ReviewConfig) -> Dash:
             ]
         )
 
-    def _row_from_store(store: dict | None, epoch_idx: int | None) -> pd.Series | None:
+    def _row_from_active_context(
+        primary_store: dict | None,
+        layer_index_store: dict[str, dict[str, Any]] | None,
+        active_layer: str | None,
+        selected_point: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any] | None, pd.Series | None]:
+        store, epoch_idx = resolve_active_context(
+            active_layer, primary_store, layer_index_store, selected_point
+        )
         if not store or epoch_idx is None:
-            return None
+            return store, None
         df = pd.DataFrame(store["epochs"])
         row = df.loc[df["epoch_idx"] == epoch_idx]
-        return None if row.empty else row.iloc[0]
+        return store, None if row.empty else row.iloc[0]
 
     @callback(
         Output("kernel-ds9-section", "style"),
         Input("event-index-store", "data"),
+        Input("layer-index-store", "data"),
+        Input("active-layer-store", "data"),
     )
-    def toggle_kernel_section(store: dict | None):
+    def toggle_kernel_section(
+        primary_store: dict | None,
+        layer_index_store: dict[str, dict[str, Any]] | None,
+        active_layer: str | None,
+    ):
+        store, _ = resolve_active_context(active_layer, primary_store, layer_index_store, None)
         if store and store.get("has_kernel_fit"):
             return {"display": "block"}
         return {"display": "none"}
@@ -958,8 +1333,15 @@ def create_app(cfg: ReviewConfig) -> Dash:
     @callback(
         Output("epoch-ds9-buttons", "children"),
         Input("event-index-store", "data"),
+        Input("layer-index-store", "data"),
+        Input("active-layer-store", "data"),
     )
-    def render_epoch_ds9_buttons(store: dict | None):
+    def render_epoch_ds9_buttons(
+        primary_store: dict | None,
+        layer_index_store: dict[str, dict[str, Any]] | None,
+        active_layer: str | None,
+    ):
+        store, _ = resolve_active_context(active_layer, primary_store, layer_index_store, None)
         products = (store or {}).get("epoch_products") or []
         return html.Div(
             [
@@ -1002,7 +1384,9 @@ def create_app(cfg: ReviewConfig) -> Dash:
         Input({"type": "epoch-ds9", "key": ALL}, "n_clicks"),
         [Input(btn_id, "n_clicks") for btn_id in _KERNEL_DS9_BTN_IDS],
         State("event-index-store", "data"),
-        State("selected-epoch", "data"),
+        State("layer-index-store", "data"),
+        State("active-layer-store", "data"),
+        State("selected-point-store", "data"),
         State("ds9-open-mode", "value"),
         prevent_initial_call=True,
     )
@@ -1011,20 +1395,31 @@ def create_app(cfg: ReviewConfig) -> Dash:
         *args: Any,
     ):
         kernel_clicks = args[: len(_KERNEL_DS9_BTN_IDS)]
-        store = args[len(_KERNEL_DS9_BTN_IDS)]
-        epoch_idx = args[len(_KERNEL_DS9_BTN_IDS) + 1]
-        open_mode = args[len(_KERNEL_DS9_BTN_IDS) + 2]
+        primary_store = args[len(_KERNEL_DS9_BTN_IDS)]
+        layer_index_store = args[len(_KERNEL_DS9_BTN_IDS) + 1]
+        active_layer = args[len(_KERNEL_DS9_BTN_IDS) + 2]
+        selected_point = args[len(_KERNEL_DS9_BTN_IDS) + 3]
+        open_mode = args[len(_KERNEL_DS9_BTN_IDS) + 4]
 
         if not ctx.triggered_id:
             return no_update
 
         ds9.open_mode = open_mode if open_mode in ("xpa", "open", "cli") else "xpa"
 
+        store, row = _row_from_active_context(
+            primary_store, layer_index_store, active_layer, selected_point
+        )
+        if not store:
+            return "No active layer loaded."
+
         btn = ctx.triggered_id
         regions = store.get("regions_path") if store else None
         crop_bounds = store.get("crop_bounds") if store else None
         event_key = store.get("event") if store else "event"
         workspace = store.get("workspace") if store else "ws"
+        _, epoch_idx = resolve_active_context(
+            active_layer, primary_store, layer_index_store, selected_point
+        )
 
         def _resolve_cropped_path(
             path: str | None,
@@ -1081,8 +1476,6 @@ def create_app(cfg: ReviewConfig) -> Dash:
                 msg = f"{msg} ({warning})"
             return html.Span(msg, style={"color": color})
 
-        row = _row_from_store(store, epoch_idx)
-
         if isinstance(btn, dict) and btn.get("type") == "epoch-ds9":
             product = _epoch_product_from_row(row, str(btn.get("key")))
             if product is None:
@@ -1097,7 +1490,6 @@ def create_app(cfg: ReviewConfig) -> Dash:
                 return _enqueue_cropped(path, kind="template", label=label, needs_epoch=needs_epoch)
             return _enqueue(path, is_diff=kind == "diff", label=label, needs_epoch=needs_epoch)
 
-        mask_path = store.get("mask_path") if store else None
         if btn == "btn-kernel-ref":
             return _enqueue(
                 store.get("kernel_reference_path"), is_diff=False, label="kernel reference", needs_epoch=False
@@ -1107,7 +1499,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
                 store.get("kernel_template_path"), is_diff=False, label="template", needs_epoch=False
             )
         if btn == "btn-kernel-mask":
-            return _enqueue(mask_path, is_diff=False, label="mask", needs_epoch=False)
+            return _enqueue(store.get("mask_path"), is_diff=False, label="mask", needs_epoch=False)
         if btn == "btn-hp1-phot-bkg":
             return _enqueue(
                 store.get("kernel_phot_bkg_fine_path"),

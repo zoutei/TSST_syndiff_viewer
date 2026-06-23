@@ -102,6 +102,19 @@ The viewer detects the layout at read time:
 - **Legacy:** no `methods`, but `lightcurve.csv` exists → Target lists `primary`, `offset_top`, …
 - **Inferred:** no `methods` and no `lightcurve.csv`, but `lightcurve_{method}.csv` files exist → methods parsed from filenames.
 
+## Compare layers
+
+Overlay multiple SynDiff light curves on one plot (same event, different workspace or target):
+
+1. Use the top dropdowns to pick a curve, then click **Add to compare** to snapshot it as a compare chip.
+2. Change the top dropdowns to another workspace or target; the plot updates the primary curve. Add more chips as needed.
+3. Click a compare chip to make it the **active layer** (highlighted). The sidebar, DS9 buttons, binned/rejected markers, and product-ID search use the active layer's workspace and FITS paths.
+4. Click any Syndiff point on the plot to activate that layer and select an epoch.
+5. When a compare chip is active, adjust **Offset** in the compare strip to vertically align curves.
+6. Up to five compare layers. Layers identical to the current primary are not drawn twice (but remain in the chip list).
+
+TESSreduce remains a separate external overlay toggle.
+
 ## FITS cropping for DS9
 
 Diff images and pipeline products are already cropped to the diff ROI. Full-chip FFIs and syndiff templates are cropped on demand when you click **Open FFI** or **Open Template**:
@@ -117,7 +130,7 @@ Template paths are resolved from `{workspace}/templates` (symlink) using manifes
 ## Tests
 
 ```bash
-pytest tests/test_review_smoothing.py tests/test_review_event_index.py tests/test_review_ds9.py tests/test_review_pipeline_labels.py -v
+pytest tests/test_review_smoothing.py tests/test_review_event_index.py tests/test_review_ds9.py tests/test_review_pipeline_labels.py tests/test_review_overlay.py -v
 pytest tests/test_review_integration.py -v   # requires NFS workspace
 ```
 

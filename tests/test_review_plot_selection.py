@@ -3,9 +3,16 @@
 import pandas as pd
 
 from review.app import _epoch_from_plot_click, find_epoch_idx_by_product_id
+from review.overlay_layers import PRIMARY_LAYER_KEY, point_from_plot_click
 
 
 def test_epoch_from_flux_marker_click():
+    click = {"points": [{"customdata": [PRIMARY_LAYER_KEY, 42], "curveNumber": 1}]}
+    assert point_from_plot_click(click) == {"layer": PRIMARY_LAYER_KEY, "epoch_idx": 42}
+    assert _epoch_from_plot_click(click) == 42
+
+
+def test_epoch_from_legacy_primary_customdata():
     click = {"points": [{"customdata": 42, "curveNumber": 1}]}
     assert _epoch_from_plot_click(click) == 42
 
