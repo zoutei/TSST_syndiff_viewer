@@ -14,7 +14,7 @@ Laptop-only Dash app for SynDiff pipeline outputs. Reads event data from the STS
 ```bash
 cd syndiff_viewer
 pip install -e ".[dev]"
-syndiff-review --event s0023_c1_k3_2020ftl
+syndiff-viewer --event s0023_c1_k3_2020ftl
 ```
 
 Open http://127.0.0.1:8050

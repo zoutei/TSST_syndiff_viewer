@@ -5,7 +5,7 @@ import pytest
 from review.event_index import EventIndex, epoch_file_exists
 from review.mount import DEFAULT_MOUNT_ROOT
 
-MOUNT = os.environ.get("SYNDIFF_REVIEW_MOUNT", DEFAULT_MOUNT_ROOT)
+MOUNT = os.environ.get("SYNDIFF_VIEWER_MOUNT", DEFAULT_MOUNT_ROOT)
 EVENT = "s0023_c1_k3_2020ftl"
 
 pytestmark = pytest.mark.skipif(
