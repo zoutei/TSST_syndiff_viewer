@@ -79,7 +79,28 @@ Use `--no-sync` to skip syncing, or `--cache-dir` to override the cache location
 
 **Refresh lists** re-scans NFS for new events and workspaces and updates the dropdown options. It shows a spinner while syncing metadata for the current event. It does **not** reload the plot.
 
-The plot loads when you pick an event, workspace, photometry dir, or target from the dropdowns. Subsequent target changes within the same workspace reuse a cached NFS `master/` index so switching targets stays fast.
+The plot loads when you pick an event, workspace, photometry dir, or target from the dropdowns. Subsequent target changes within the same workspace reuse a cached NFS `master/` index so switching light curves stays fast.
+
+### Photometry dropdowns
+
+| Dropdown | Meaning |
+|----------|---------|
+| **Photometry** | `lc_*` output directory from `forced_photometry` |
+| **Target** | Combined method and position: `prf_primary`, `ap3_primary`, `prf_offset_top`, … |
+
+For legacy workspaces with `lightcurve.csv`, the Target dropdown uses `primary`, `offset_top`, etc. (no method prefix).
+
+CSV files on disk follow the pipeline naming: `lightcurve_{method}.csv` / `lightcurve_{method}_{target}.csv`. Aperture method CSVs include `flux_wo_sky`; the plot uses that sky-subtracted column.
+
+Set the default target in `review.yaml`: `default_lc: prf_primary` (or `primary` for legacy workspaces).
+
+### Backward compatibility
+
+The viewer detects the layout at read time:
+
+- **New:** `forced_photometry.methods` in frozen `diff_config.yaml` → Target lists `{method}_{target}` combinations that exist on disk.
+- **Legacy:** no `methods`, but `lightcurve.csv` exists → Target lists `primary`, `offset_top`, …
+- **Inferred:** no `methods` and no `lightcurve.csv`, but `lightcurve_{method}.csv` files exist → methods parsed from filenames.
 
 ## FITS cropping for DS9
 

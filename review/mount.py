@@ -5,6 +5,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from review.pipeline_labels import (
+    list_lightcurve_selections,
+    parse_diff_config,
+    parse_lightcurve_selection,
+    resolve_lightcurve_filename,
+)
+
 # STScI Macs automount cs10d at /System/Volumes/Data/astro (also /astro).
 DEFAULT_MOUNT_ROOT = "/System/Volumes/Data/astro/armin/koji/syndiff/workspace"
 FALLBACK_MOUNT_ROOTS: tuple[str, ...] = (
@@ -62,8 +69,15 @@ def is_workspace_dir(path: Path) -> bool:
 
 
 def is_photometry_dir(path: Path) -> bool:
-    """Return True if *path* is a photometry output dir (``lc_*`` with a primary LC)."""
-    return path.is_dir() and path.name.startswith("lc_") and (path / "lightcurve.csv").is_file()
+    """Return True if *path* is a photometry output dir (``lc_*`` with light-curve CSVs)."""
+    if not path.is_dir() or not path.name.startswith("lc_"):
+        return False
+    if (path / "lightcurve.csv").is_file():
+        return True
+    return any(
+        entry.is_file() and entry.name.startswith("lightcurve_") and entry.suffix == ".csv"
+        for entry in path.iterdir()
+    )
 
 
 def list_workspaces(event_dir: str | Path) -> list[str]:
@@ -79,7 +93,7 @@ def list_workspaces(event_dir: str | Path) -> list[str]:
 
 
 def list_photometry_dirs(workspace_dir: str | Path) -> list[str]:
-    """Return photometry subdir names (``lc_*``) that contain ``lightcurve.csv``."""
+    """Return photometry subdir names (``lc_*``) that contain light-curve CSVs."""
     ws = Path(os.path.expanduser(str(workspace_dir)))
     if not ws.is_dir():
         return []
@@ -122,8 +136,19 @@ def is_healthy(
     if not phot_dirs:
         return False, f"No photometry dir in {meta_ws}"
 
-    lc_name = lc_dir if lc_dir in phot_dirs else phot_dirs[0]
-    lc = meta_ws / lc_name / "lightcurve.csv"
+    lc_dir_name = lc_dir if lc_dir in phot_dirs else phot_dirs[0]
+    meta_lc_dir = meta_ws / lc_dir_name
+    labels = parse_diff_config(meta_ws / "diff_config.yaml")
+    selections = list_lightcurve_selections(labels, meta_lc_dir)
+    if not selections:
+        return False, f"No light curves in {meta_lc_dir}"
+
+    lc_filename = resolve_lightcurve_filename(
+        *parse_lightcurve_selection(selections[0], labels, meta_lc_dir),
+        labels,
+        meta_lc_dir,
+    )
+    lc = meta_lc_dir / lc_filename
     master = fits_ws / "master"
 
     if not lc.is_file():
@@ -134,7 +159,7 @@ def is_healthy(
     has_fits = next((True for p in master.iterdir() if p.suffix.lower() == ".fits"), False)
     if not has_fits:
         return False, f"No FITS files in {master}"
-    return True, f"OK: {test_event}/{ws_name}/{lc_name}"
+    return True, f"OK: {test_event}/{ws_name}/{lc_dir_name}"
 
 
 def list_events(mount_root: str | Path) -> list[str]:

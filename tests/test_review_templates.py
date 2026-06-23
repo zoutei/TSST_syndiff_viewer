@@ -7,7 +7,7 @@ import yaml
 from astropy.io import fits
 
 from review.crop_cache import ensure_cropped_fits
-from review.pipeline_labels import list_lightcurve_options, parse_diff_config
+from review.pipeline_labels import parse_diff_config, parse_lightcurve_selection, resolve_lightcurve_filename
 from review.support.templates import (
     ConvTemplateIndex,
     find_template_by_offset,
@@ -21,7 +21,12 @@ def test_offset_lightcurve_filename_not_doubled(tmp_path):
     cfg = {
         "pipeline": [
             {"kind": "hotpants", "output": {"diffs": "hp_d"}},
-            {"kind": "forced_photometry", "inputs": {"diffs": "hp_d"}, "output": "lc_prf_on_diffs"},
+            {
+                "kind": "forced_photometry",
+                "inputs": {"diffs": "hp_d"},
+                "output": "lc_prf_on_diffs",
+                "methods": [{"name": "prf", "type": "psf", "psf_type": "prf"}],
+            },
         ],
         "additional_forced_targets": [
             {"name": "offset_top", "position_mode": "offset", "dx": 0, "dy": -7},
@@ -30,9 +35,10 @@ def test_offset_lightcurve_filename_not_doubled(tmp_path):
     path = tmp_path / "diff_config.yaml"
     path.write_text(yaml.dump(cfg))
     labels = parse_diff_config(path)
-    options = dict(list_lightcurve_options(labels))
-    assert options["offset_top"] == "lightcurve_offset_top.csv"
-    assert "offset_offset_top" not in options
+    lc_dir = tmp_path / "lc_prf_on_diffs"
+    lc_dir.mkdir()
+    method, target = parse_lightcurve_selection("prf_offset_top", labels, lc_dir)
+    assert resolve_lightcurve_filename(method, target, labels, lc_dir) == "lightcurve_prf_offset_top.csv"
 
 
 def test_parse_syndiff_template_filename():

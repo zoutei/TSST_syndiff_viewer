@@ -17,7 +17,7 @@ from .crop_cache import ensure_cropped_fits
 from .ds9 import Ds9Controller
 from .event_index import EventIndex, clear_index_cache, master_index_is_cached
 from .mount import is_healthy, list_events, list_photometry_dirs, list_workspaces
-from .pipeline_labels import list_lightcurve_options, parse_diff_config
+from .pipeline_labels import list_lightcurve_selections, parse_diff_config
 from .smoothing import SmoothingMode, apply_smoothing
 from .sync_cache import sync_event_metadata, sync_workspace_metadata
 from .tessreduce import clear_tessreduce_cache, load_tessreduce_for_event, tessreduce_store_payload
@@ -169,13 +169,16 @@ def _photometry_options(
 
 
 def _target_options(
-    cfg: ReviewConfig, event: str, workspace: str | None
-) -> tuple[list[dict[str, str]], str]:
-    if not workspace:
+    cfg: ReviewConfig, event: str, workspace: str | None, lc_dir: str | None
+) -> tuple[list[dict[str, str]], str | None]:
+    if not workspace or not lc_dir:
         return [], cfg.default_lc
-    labels = parse_diff_config(cfg.event_dir(event) / workspace / "diff_config.yaml")
-    options = [{"label": name, "value": name} for name, _fname in list_lightcurve_options(labels)]
-    return options, cfg.default_lc
+    ws_dir = cfg.event_dir(event) / workspace
+    labels = parse_diff_config(ws_dir / "diff_config.yaml")
+    selections = list_lightcurve_selections(labels, ws_dir / lc_dir)
+    options = [{"label": name, "value": name} for name in selections]
+    default = cfg.default_lc if cfg.default_lc in selections else (selections[0] if selections else None)
+    return options, default
 
 
 def create_app(cfg: ReviewConfig) -> Dash:
@@ -235,7 +238,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
                                     value=cfg.default_lc,
                                     clearable=False,
                                     placeholder="Target",
-                                    style={"width": "180px"},
+                                    style={"width": "200px"},
                                 ),
                             ],
                             style={"display": "flex", "gap": "12px", "alignItems": "center", "flexWrap": "wrap"},
@@ -534,15 +537,15 @@ def create_app(cfg: ReviewConfig) -> Dash:
     def update_target_options(
         event: str,
         workspace: str | None,
-        _lc_dir: str | None,
+        lc_dir: str | None,
         target: str | None,
         token: int | None,
     ):
-        if not workspace:
+        if not workspace or not lc_dir:
             return [], cfg.default_lc, token or 0
         try:
-            options, default = _target_options(cfg, event, workspace)
-            value = _pick_dropdown_value(target, options, default)
+            options, default = _target_options(cfg, event, workspace, lc_dir)
+            value = _pick_dropdown_value(target, options, default or cfg.default_lc)
             next_token = (token or 0) + 1
             return options, value, next_token
         except Exception:
@@ -588,7 +591,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
             phot_options, phot_default = _photometry_options(cfg, event, workspace)
             lc_dir = _pick_dropdown_value(cur_lc, phot_options, phot_default or "")
 
-            tgt_options, tgt_default = _target_options(cfg, event, workspace)
+            tgt_options, tgt_default = _target_options(cfg, event, workspace, lc_dir)
             target = _pick_dropdown_value(cur_target, tgt_options, tgt_default)
 
             return (
@@ -622,15 +625,18 @@ def create_app(cfg: ReviewConfig) -> Dash:
         lc_dir: str | None,
         target: str,
     ):
-        if not workspace or not lc_dir:
-            return None, "Select event, workspace, and photometry", {"color": "#c62828", "fontWeight": "bold"}
+        if not workspace or not lc_dir or not target:
+            return None, "Select event, workspace, photometry, and target", {
+                "color": "#c62828",
+                "fontWeight": "bold",
+            }
         cache_key = _store_payload_key(event, workspace, lc_dir, target)
         cached_payload = _store_payload_cache.get(cache_key)
         if cached_payload is not None:
             return cached_payload
         fits_event = cfg.source_event_dir(event)
         if master_index_is_cached(fits_event, workspace):
-            ok, msg = True, f"OK: {event}/{workspace}/{lc_dir}"
+            ok, msg = True, f"OK: {event}/{workspace}/{lc_dir}/{target}"
         else:
             ok, msg = is_healthy(
                 cfg.data_mount_expanded,

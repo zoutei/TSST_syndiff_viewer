@@ -30,7 +30,7 @@ class ReviewConfig:
     port: int = 8050
     default_event: str = "s0023_c1_k3_2020ftl"
     default_workspace: str = "ws"
-    default_lc: str = "primary"
+    default_lc: str = "prf_primary"
     gap_threshold_days: float = 1.0
     gap_auto: bool = True
     bin_width_hours: float = 6.0

@@ -8,13 +8,20 @@ from astropy.io import fits
 
 from review.event_index import (
     EventIndex,
+    _read_lightcurve,
     clear_index_cache,
     epoch_file_exists,
     get_master_index,
     get_workspace_context,
     master_index_is_cached,
 )
-from review.pipeline_labels import list_lightcurve_options, parse_diff_config
+from review.pipeline_labels import (
+    list_forced_targets,
+    list_lightcurve_selections,
+    parse_diff_config,
+    parse_lightcurve_selection,
+    resolve_lightcurve_filename,
+)
 
 
 def _write_minimal_event(tmp: Path) -> Path:
@@ -78,11 +85,15 @@ def _write_minimal_event(tmp: Path) -> Path:
 def test_parse_diff_config(tmp_path):
     event = _write_minimal_event(tmp_path)
     labels = parse_diff_config(event / "ws" / "diff_config.yaml")
+    lc_dir = event / "ws" / "lc_prf_on_diffs"
     assert labels.diff_label == "hp_d"
     assert labels.lc_dir == "lc_prf_on_diffs"
     assert labels.additional_targets == ["offset_top"]
-    options = dict(list_lightcurve_options(labels))
-    assert options["offset_top"] == "lightcurve_offset_top.csv"
+    assert list_forced_targets(labels) == ["primary", "offset_top"]
+    (lc_dir / "lightcurve_offset_top.csv").write_text((lc_dir / "lightcurve.csv").read_text())
+    assert list_lightcurve_selections(labels, lc_dir) == ["primary", "offset_top"]
+    method, target = parse_lightcurve_selection("offset_top", labels, lc_dir)
+    assert resolve_lightcurve_filename(method, target, labels, lc_dir) == "lightcurve_offset_top.csv"
 
 
 def test_event_index_resolves_master_paths(tmp_path):
@@ -147,6 +158,63 @@ def test_workspace_context_reused_across_targets(tmp_path):
     ctx3 = get_workspace_context(event, event, "ws")
     assert ctx3 is ctx1
     clear_index_cache()
+
+
+def _write_multi_method_event(tmp: Path) -> Path:
+    event = _write_minimal_event(tmp)
+    lc_dir = event / "ws" / "lc_prf_on_diffs"
+    diff_cfg = yaml.safe_load((event / "ws" / "diff_config.yaml").read_text())
+    diff_cfg["pipeline"][1]["methods"] = [
+        {"name": "prf", "type": "psf", "psf_type": "prf"},
+        {"name": "ap3", "type": "aperture", "tar_ap": 3},
+    ]
+    (event / "ws" / "diff_config.yaml").write_text(yaml.dump(diff_cfg))
+    (lc_dir / "lightcurve_prf.csv").write_text((lc_dir / "lightcurve.csv").read_text())
+    offset = pd.DataFrame(
+        [
+            {
+                "btjd": 1928.94,
+                "flux": 9.0,
+                "eflux": 1.0,
+                "filename": str(event / "ws" / "hp_d" / "tess2020019142923_hp_d.fits"),
+                "group_id": 0,
+            }
+        ]
+    )
+    offset.to_csv(lc_dir / "lightcurve_prf_offset_top.csv", index=False)
+    ap3 = pd.DataFrame(
+        [
+            {
+                "btjd": 1928.94,
+                "flux": 100.0,
+                "flux_wo_sky": 8.5,
+                "sky": 91.5,
+                "eflux": 0.8,
+                "filename": str(event / "ws" / "hp_d" / "tess2020019142923_hp_d.fits"),
+                "group_id": 0,
+            }
+        ]
+    )
+    ap3.to_csv(lc_dir / "lightcurve_ap3.csv", index=False)
+    return event
+
+
+def test_event_index_multi_method_offset_target(tmp_path):
+    clear_index_cache()
+    event = _write_multi_method_event(tmp_path)
+    idx = EventIndex.load(event, lc_name="prf_offset_top")
+    assert len(idx.epochs) == 1
+    assert idx.epochs.iloc[0]["flux"] == 9.0
+    clear_index_cache()
+
+
+def test_read_lightcurve_uses_flux_wo_sky(tmp_path):
+    path = tmp_path / "lightcurve_ap3.csv"
+    pd.DataFrame(
+        [{"btjd": 1.0, "flux": 100.0, "flux_wo_sky": 8.5, "sky": 91.5, "eflux": 0.8}]
+    ).to_csv(path, index=False)
+    df = _read_lightcurve(path)
+    assert df.iloc[0]["flux"] == 8.5
 
 
 def _write_kernel_subtract_hotpants_event(tmp: Path) -> Path:

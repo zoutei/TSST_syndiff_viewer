@@ -149,6 +149,21 @@ def test_sync_skips_unchanged_on_second_run(tmp_path):
     assert second.skipped == first.copied
 
 
+def test_sync_copies_multi_method_lightcurve(tmp_path):
+    source = tmp_path / "source"
+    events = source / "events"
+    events.mkdir(parents=True)
+    event = _write_event(events, "event_multi")
+    lc_dir = event / "ws" / "lc_prf_on_diffs"
+    diff_cfg = yaml.safe_load((event / "ws" / "diff_config.yaml").read_text())
+    diff_cfg["pipeline"][1]["methods"] = [{"name": "prf", "type": "psf", "psf_type": "prf"}]
+    (event / "ws" / "diff_config.yaml").write_text(yaml.dump(diff_cfg))
+    pd.read_csv(lc_dir / "lightcurve.csv").to_csv(lc_dir / "lightcurve_prf.csv", index=False)
+    cache = tmp_path / "cache"
+    sync_event_metadata(source, cache, "event_multi")
+    assert (cache / "events" / "event_multi" / "ws" / "lc_prf_on_diffs" / "lightcurve_prf.csv").is_file()
+
+
 def test_event_index_dual_root(tmp_path):
     source = tmp_path / "source"
     cache = tmp_path / "cache"

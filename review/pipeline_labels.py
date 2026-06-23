@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+LEGACY_METHOD = "default"
+
 _EPOCH_STAGE_KINDS = frozenset({"hotpants", "kernel_subtract"})
 
 
@@ -45,6 +47,7 @@ class PipelineLabels:
     conv_template_label: str | None = None
     kernel_fit_dir: str | None = None
     hotpants_stages: list[HotpantsLabels] = field(default_factory=list)
+    photometry_methods: list[str] = field(default_factory=list)
     additional_targets: list[str] = field(default_factory=list)
     template_paths: dict[str | int, str] = field(default_factory=dict)
     template_dir: str | None = None
@@ -192,6 +195,150 @@ def _last_stage_output(pipeline: list[Any], stage_kind: str, output_key: str) ->
     return None
 
 
+def _parse_photometry_methods(phot: dict[str, Any]) -> list[str]:
+    methods_raw = phot.get("methods") or []
+    names: list[str] = []
+    for item in methods_raw:
+        if isinstance(item, dict) and item.get("name"):
+            names.append(str(item["name"]))
+    return names
+
+
+def lightcurve_csv_basename(method: str, target: str = "primary") -> str:
+    """Return the CSV filename for a (method, target) pair in new-style naming."""
+    if target == "primary":
+        return f"lightcurve_{method}.csv"
+    return f"lightcurve_{method}_{target}.csv"
+
+
+def _legacy_lightcurve_filename(target: str) -> str:
+    if target == "primary":
+        return "lightcurve.csv"
+    return f"lightcurve_{target}.csv"
+
+
+def _infer_photometry_methods(lc_dir: Path, additional_targets: list[str]) -> list[str]:
+    methods: set[str] = set()
+    for path in sorted(lc_dir.glob("lightcurve_*.csv")):
+        suffix = path.stem.removeprefix("lightcurve_")
+        if not suffix:
+            continue
+        matched = False
+        for target in additional_targets:
+            token = f"_{target}"
+            if suffix.endswith(token) and len(suffix) > len(token):
+                methods.add(suffix[: -len(token)])
+                matched = True
+                break
+        if not matched:
+            methods.add(suffix)
+    return sorted(methods)
+
+
+def _photometry_mode(labels: PipelineLabels, lc_dir: Path | None) -> str:
+    if labels.photometry_methods:
+        return "new"
+    if lc_dir is not None and (lc_dir / "lightcurve.csv").is_file():
+        return "legacy"
+    return "inferred"
+
+
+def list_photometry_methods(labels: PipelineLabels, lc_dir: Path | None = None) -> list[str]:
+    """Return configured or inferred photometry method names for the Method dropdown."""
+    if labels.photometry_methods:
+        return list(labels.photometry_methods)
+    if lc_dir is not None and (lc_dir / "lightcurve.csv").is_file():
+        return [LEGACY_METHOD]
+    if lc_dir is not None:
+        inferred = _infer_photometry_methods(lc_dir, labels.additional_targets)
+        if inferred:
+            return inferred
+    return []
+
+
+def list_forced_targets(labels: PipelineLabels) -> list[str]:
+    """Return forced-photometry position targets."""
+    return ["primary", *labels.additional_targets]
+
+
+def lightcurve_selection_key(method: str, target: str) -> str:
+    """Return the combined Target dropdown value for *(method, target)*."""
+    if method == LEGACY_METHOD:
+        return target
+    return f"{method}_{target}"
+
+
+def parse_lightcurve_selection(
+    key: str,
+    labels: PipelineLabels,
+    lc_dir: Path | None = None,
+) -> tuple[str, str]:
+    """Parse a Target dropdown value into *(method, target)*."""
+    if _photometry_mode(labels, lc_dir) == "legacy":
+        if key in list_forced_targets(labels):
+            return LEGACY_METHOD, key
+        raise ValueError(f"Unknown light curve selection: {key!r}")
+
+    for target in sorted(list_forced_targets(labels), key=len, reverse=True):
+        if target == "primary":
+            continue
+        suffix = f"_{target}"
+        if key.endswith(suffix):
+            method = key[: -len(suffix)]
+            if method:
+                return method, target
+
+    primary_suffix = "_primary"
+    if key.endswith(primary_suffix):
+        method = key[: -len(primary_suffix)]
+        if method:
+            return method, "primary"
+
+    methods = list_photometry_methods(labels, lc_dir)
+    if key in methods:
+        return key, "primary"
+
+    raise ValueError(f"Unknown light curve selection: {key!r}")
+
+
+def list_lightcurve_selections(labels: PipelineLabels, lc_dir: Path | None = None) -> list[str]:
+    """Return combined method/target keys for the Target dropdown."""
+    mode = _photometry_mode(labels, lc_dir)
+    if mode == "legacy":
+        keys = list_forced_targets(labels)
+    else:
+        methods = list_photometry_methods(labels, lc_dir)
+        targets = list_forced_targets(labels)
+        keys = [lightcurve_selection_key(method, target) for method in methods for target in targets]
+
+    if lc_dir is None:
+        return keys
+
+    existing: list[str] = []
+    for key in keys:
+        method, target = parse_lightcurve_selection(key, labels, lc_dir)
+        filename = resolve_lightcurve_filename(method, target, labels, lc_dir)
+        if (lc_dir / filename).is_file():
+            existing.append(key)
+    return existing
+
+
+def resolve_lightcurve_filename(
+    method: str,
+    target: str,
+    labels: PipelineLabels,
+    lc_dir: Path,
+) -> str:
+    """Resolve the light-curve CSV basename for *(method, target)*."""
+    mode = _photometry_mode(labels, lc_dir)
+    if mode == "legacy":
+        return _legacy_lightcurve_filename(target)
+    if mode == "new":
+        return lightcurve_csv_basename(method, target)
+    # inferred: new-style filenames on disk without methods in frozen config
+    return lightcurve_csv_basename(method, target)
+
+
 def parse_diff_config(path: str | Path) -> PipelineLabels:
     """Load ``ws/diff_config.yaml`` and return review-relevant workspace labels."""
     cfg_path = Path(path)
@@ -228,6 +375,7 @@ def parse_diff_config(path: str | Path) -> PipelineLabels:
         hotpants_stages.append(_fallback_hotpants_stage(len(hotpants_stages)))
 
     lc_label = str(phot.get("output") or "lc_prf_on_diffs")
+    photometry_methods = _parse_photometry_methods(phot)
 
     additional: list[str] = []
     for item in raw.get("additional_forced_targets") or []:
@@ -258,17 +406,10 @@ def parse_diff_config(path: str | Path) -> PipelineLabels:
         conv_template_label=conv_template_label,
         kernel_fit_dir=kernel_fit_dir,
         hotpants_stages=hotpants_stages,
+        photometry_methods=photometry_methods,
         additional_targets=additional,
         template_paths=dict(template_paths),
         template_dir=template_dir,
         pipeline=pipeline_entries,
     )
     return replace(labels, epoch_products=list_epoch_products(labels))
-
-
-def list_lightcurve_options(labels: PipelineLabels) -> list[tuple[str, str]]:
-    """Return ``[(display_name, filename), ...]`` for the LC selector dropdown."""
-    options = [("primary", "lightcurve.csv")]
-    for name in labels.additional_targets:
-        options.append((name, f"lightcurve_{name}.csv"))
-    return options

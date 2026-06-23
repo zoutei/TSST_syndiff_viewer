@@ -12,7 +12,7 @@ from review.mount import (
 )
 
 
-def _write_event_with_workspaces(tmp: Path) -> Path:
+def _write_event_with_workspaces(tmp: Path, *, new_style: bool = False) -> Path:
     event = tmp / "s0040_test"
     for ws_name in ("ws", "ws_single_hp_kernel"):
         ws = event / ws_name
@@ -20,16 +20,16 @@ def _write_event_with_workspaces(tmp: Path) -> Path:
         master = ws / "master"
         lc.mkdir(parents=True)
         master.mkdir(parents=True)
+        phot_stage: dict = {"kind": "forced_photometry", "output": "lc_prf_on_diffs"}
+        if new_style:
+            phot_stage["methods"] = [{"name": "prf", "type": "psf", "psf_type": "prf"}]
         (ws / "diff_config.yaml").write_text(
-            yaml.dump(
-                {
-                    "pipeline": [
-                        {"kind": "forced_photometry", "output": "lc_prf_on_diffs"},
-                    ]
-                }
-            )
+            yaml.dump({"pipeline": [phot_stage]})
         )
-        (lc / "lightcurve.csv").write_text("btjd,flux,eflux\n1,1,0.1\n")
+        if new_style:
+            (lc / "lightcurve_prf.csv").write_text("btjd,flux,eflux\n1,1,0.1\n")
+        else:
+            (lc / "lightcurve.csv").write_text("btjd,flux,eflux\n1,1,0.1\n")
     return event
 
 
@@ -38,8 +38,13 @@ def test_list_workspaces(tmp_path):
     assert list_workspaces(event) == ["ws", "ws_single_hp_kernel"]
 
 
-def test_list_photometry_dirs(tmp_path):
-    event = _write_event_with_workspaces(tmp_path)
+def test_list_photometry_dirs_legacy(tmp_path):
+    event = _write_event_with_workspaces(tmp_path, new_style=False)
+    assert list_photometry_dirs(event / "ws") == ["lc_prf_on_diffs"]
+
+
+def test_list_photometry_dirs_new_style(tmp_path):
+    event = _write_event_with_workspaces(tmp_path, new_style=True)
     assert list_photometry_dirs(event / "ws") == ["lc_prf_on_diffs"]
 
 
@@ -80,6 +85,11 @@ def test_workspace_and_photometry_helpers(tmp_path):
 
     lc = tmp_path / "lc_prf_on_diffs"
     lc.mkdir()
-    (lc / "lightcurve.csv").write_text("btjd\n")
+    (lc / "lightcurve_prf.csv").write_text("btjd\n")
     assert is_photometry_dir(lc)
     assert not is_photometry_dir(tmp_path / "hp_d")
+
+    legacy = tmp_path / "lc_legacy"
+    legacy.mkdir()
+    (legacy / "lightcurve.csv").write_text("btjd\n")
+    assert is_photometry_dir(legacy)

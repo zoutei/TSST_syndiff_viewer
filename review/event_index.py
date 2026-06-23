@@ -33,8 +33,9 @@ from .pipeline_labels import (
     EpochProduct,
     PipelineLabels,
     list_epoch_products,
-    list_lightcurve_options,
     parse_diff_config,
+    parse_lightcurve_selection,
+    resolve_lightcurve_filename,
 )
 
 log = logging.getLogger(__name__)
@@ -271,16 +272,25 @@ class EventIndex:
         lc_name: str = "primary",
         lc_filename: str | None = None,
         fits_event_dir: str | Path | None = None,
+        lc_method: str | None = None,
     ) -> EventIndex:
         event_path = Path(event_dir).resolve()
         fits_path = Path(fits_event_dir).resolve() if fits_event_dir else event_path
         ws_ctx = get_workspace_context(event_path, fits_path, workspace_subdir)
         labels = ws_ctx.labels
         resolved_lc_dir = lc_dir or labels.lc_dir
-        if lc_filename is None:
-            lc_filename = _lc_filename_for_name(labels, lc_name)
+        meta_lc_dir = event_path / workspace_subdir / resolved_lc_dir
+        if lc_method is not None:
+            from .pipeline_labels import lightcurve_selection_key
 
-        lc_path = event_path / workspace_subdir / resolved_lc_dir / lc_filename
+            selection = lightcurve_selection_key(lc_method, lc_name)
+        else:
+            selection = lc_name
+        if lc_filename is None:
+            method, target = parse_lightcurve_selection(selection, labels, meta_lc_dir)
+            lc_filename = resolve_lightcurve_filename(method, target, labels, meta_lc_dir)
+
+        lc_path = meta_lc_dir / lc_filename
         lc_df = _read_lightcurve(lc_path)
 
         cluster_job_path = event_path / CLUSTER_TEMPLATE_JOB_BASENAME
@@ -313,7 +323,7 @@ class EventIndex:
             workspace_subdir=workspace_subdir,
             labels=labels,
             epochs=epochs,
-            lc_name=lc_name,
+            lc_name=selection,
             lc_dir=resolved_lc_dir,
             fits_event_dir=fits_path,
             crop_bounds=ws_ctx.crop_bounds,
@@ -492,15 +502,6 @@ def epoch_file_exists(row: Mapping[str, Any]) -> dict[str, bool]:
     }
 
 
-def _lc_filename_for_name(labels: PipelineLabels, lc_name: str) -> str:
-    for name, filename in list_lightcurve_options(labels):
-        if name == lc_name:
-            return filename
-    if lc_name.endswith(".csv"):
-        return lc_name
-    raise ValueError(f"Unknown light curve name: {lc_name!r}")
-
-
 def _lc_rows_compatible(paths_df: pd.DataFrame, lc_df: pd.DataFrame) -> bool:
     if len(paths_df) != len(lc_df):
         return False
@@ -530,6 +531,9 @@ def _read_lightcurve(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     if "btjd" not in df.columns:
         raise ValueError(f"Light curve missing btjd column: {path}")
+    if "flux_wo_sky" in df.columns:
+        df = df.copy()
+        df["flux"] = df["flux_wo_sky"]
     ok = df["btjd"].notna() & np.isfinite(df["btjd"].astype(float))
     if "flux" in df.columns:
         ok &= df["flux"].notna()
