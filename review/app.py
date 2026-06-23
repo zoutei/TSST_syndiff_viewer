@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, callback, ctx, dcc, html, no_update
+from dash import ALL, Dash, Input, Output, State, callback, ctx, dcc, html, no_update
 
 from .config import ReviewConfig
 from .crop_cache import ensure_cropped_fits
@@ -319,16 +319,7 @@ def create_app(cfg: ReviewConfig) -> Dash:
                             html.Div(id="epoch-meta"),
                             html.Hr(),
                             html.H5("Selected FFI"),
-                            _ds9_button_grid(
-                                [
-                                    ("btn-diff", "Open Diff"),
-                                    ("btn-sci", "Open FFI"),
-                                    ("btn-template", "Open Template"),
-                                    ("btn-conv-template", "Open Conv Template"),
-                                    ("btn-bkg", "Open Background"),
-                                    ("btn-mask", "Open Mask"),
-                                ]
-                            ),
+                            html.Div(id="epoch-ds9-buttons"),
                             html.Div(
                                 id="kernel-ds9-section",
                                 children=[
@@ -1085,13 +1076,26 @@ def create_app(cfg: ReviewConfig) -> Dash:
             return hide, show, show
         return hide, show, hide
 
-    _DS9_BTN_IDS = (
-        "btn-diff",
-        "btn-sci",
-        "btn-template",
-        "btn-conv-template",
-        "btn-bkg",
-        "btn-mask",
+    @callback(
+        Output("epoch-ds9-buttons", "children"),
+        Input("event-index-store", "data"),
+    )
+    def render_epoch_ds9_buttons(store: dict | None):
+        products = (store or {}).get("epoch_products") or []
+        return html.Div(
+            [
+                html.Button(
+                    product["button_label"],
+                    id={"type": "epoch-ds9", "key": product["key"]},
+                    n_clicks=0,
+                    style={"margin": "2px 4px 2px 0"},
+                )
+                for product in products
+            ],
+            style={"display": "flex", "flexWrap": "wrap"},
+        )
+
+    _KERNEL_DS9_BTN_IDS = (
         "btn-kernel-ref",
         "btn-kernel-template",
         "btn-hp1-diff",
@@ -1103,19 +1107,34 @@ def create_app(cfg: ReviewConfig) -> Dash:
         "btn-kernel-mask",
     )
 
+    def _epoch_product_from_row(row: pd.Series | None, key: str) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        products = row.get("products")
+        if not isinstance(products, list):
+            return None
+        for product in products:
+            if isinstance(product, dict) and product.get("key") == key:
+                return product
+        return None
+
     @callback(
         Output("ds9-status", "children"),
-        [Input(btn_id, "n_clicks") for btn_id in _DS9_BTN_IDS],
+        Input({"type": "epoch-ds9", "key": ALL}, "n_clicks"),
+        [Input(btn_id, "n_clicks") for btn_id in _KERNEL_DS9_BTN_IDS],
         State("event-index-store", "data"),
         State("selected-epoch", "data"),
         State("ds9-open-mode", "value"),
         prevent_initial_call=True,
     )
-    def ds9_buttons(*args):
-        n_clicks = args[: len(_DS9_BTN_IDS)]
-        store = args[len(_DS9_BTN_IDS)]
-        epoch_idx = args[len(_DS9_BTN_IDS) + 1]
-        open_mode = args[len(_DS9_BTN_IDS) + 2]
+    def ds9_buttons(
+        _epoch_clicks: list[int | None],
+        *args: Any,
+    ):
+        kernel_clicks = args[: len(_KERNEL_DS9_BTN_IDS)]
+        store = args[len(_KERNEL_DS9_BTN_IDS)]
+        epoch_idx = args[len(_KERNEL_DS9_BTN_IDS) + 1]
+        open_mode = args[len(_KERNEL_DS9_BTN_IDS) + 2]
 
         if not ctx.triggered_id:
             return no_update
@@ -1124,7 +1143,6 @@ def create_app(cfg: ReviewConfig) -> Dash:
 
         btn = ctx.triggered_id
         regions = store.get("regions_path") if store else None
-        mask_path = store.get("mask_path") if store else None
         crop_bounds = store.get("crop_bounds") if store else None
         event_key = store.get("event") if store else "event"
         workspace = store.get("workspace") if store else "ws"
@@ -1186,24 +1204,21 @@ def create_app(cfg: ReviewConfig) -> Dash:
 
         row = _row_from_store(store, epoch_idx)
 
-        if btn == "btn-diff":
-            return _enqueue(row["diff_path"] if row is not None else None, is_diff=True, label="diff")
-        if btn == "btn-sci":
-            return _enqueue_cropped(
-                row["sci_path"] if row is not None else None, kind="ffi", label="FFI"
-            )
-        if btn == "btn-template":
-            return _enqueue_cropped(
-                row["template_path"] if row is not None else None, kind="template", label="template"
-            )
-        if btn == "btn-conv-template":
-            path = row.get("conv_template_path") or row.get("conv_path") if row is not None else None
-            return _enqueue(path, is_diff=False, label="conv template")
-        if btn == "btn-bkg":
-            return _enqueue(row["bkg_path"] if row is not None else None, is_diff=False, label="background")
-        if btn == "btn-mask":
-            return _enqueue(mask_path, is_diff=False, label="mask", needs_epoch=False)
+        if isinstance(btn, dict) and btn.get("type") == "epoch-ds9":
+            product = _epoch_product_from_row(row, str(btn.get("key")))
+            if product is None:
+                return "Unknown product."
+            label = str(product.get("button_label") or product.get("key") or "image")
+            path = product.get("path")
+            needs_epoch = bool(product.get("needs_epoch", True))
+            kind = str(product.get("kind") or "")
+            if kind == "sci":
+                return _enqueue_cropped(path, kind="ffi", label=label, needs_epoch=needs_epoch)
+            if kind == "template":
+                return _enqueue_cropped(path, kind="template", label=label, needs_epoch=needs_epoch)
+            return _enqueue(path, is_diff=kind == "diff", label=label, needs_epoch=needs_epoch)
 
+        mask_path = store.get("mask_path") if store else None
         if btn == "btn-kernel-ref":
             return _enqueue(
                 store.get("kernel_reference_path"), is_diff=False, label="kernel reference", needs_epoch=False

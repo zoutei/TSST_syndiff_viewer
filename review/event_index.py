@@ -29,7 +29,13 @@ from review.support.templates import (
 )
 
 from .paths_resolve import resolve_fits_path
-from .pipeline_labels import PipelineLabels, list_lightcurve_options, parse_diff_config
+from .pipeline_labels import (
+    EpochProduct,
+    PipelineLabels,
+    list_epoch_products,
+    list_lightcurve_options,
+    parse_diff_config,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +104,68 @@ def _manifest_by_pid(manifest_df: pd.DataFrame) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _resolve_epoch_product_path(
+    product: EpochProduct,
+    *,
+    master_index: _MasterIndex,
+    fits_ws: Path,
+    product_id: str | None,
+    sci_path: Path | None,
+    template_path: Path | None,
+    conv_template_path: Path | None,
+    mask_path: str | None,
+) -> Path | None:
+    if product.kind == "sci":
+        return sci_path
+    if product.kind == "template":
+        return template_path
+    if product.kind == "conv_template":
+        return conv_template_path
+    if product.kind == "mask":
+        return Path(mask_path) if mask_path else None
+    if product.workspace_label:
+        return _resolve_master_or_workspace(
+            master_index, fits_ws, product_id, product.workspace_label
+        )
+    return None
+
+
+def _build_epoch_products(
+    labels: PipelineLabels,
+    *,
+    master_index: _MasterIndex,
+    fits_ws: Path,
+    product_id: str | None,
+    sci_path: Path | None,
+    template_path: Path | None,
+    conv_template_path: Path | None,
+    mask_path: str | None,
+) -> list[dict[str, Any]]:
+    products = labels.epoch_products or list_epoch_products(labels)
+    rows: list[dict[str, Any]] = []
+    for product in products:
+        path = _resolve_epoch_product_path(
+            product,
+            master_index=master_index,
+            fits_ws=fits_ws,
+            product_id=product_id,
+            sci_path=sci_path,
+            template_path=template_path,
+            conv_template_path=conv_template_path,
+            mask_path=mask_path,
+        )
+        rows.append(
+            {
+                "key": product.key,
+                "button_label": product.button_label,
+                "kind": product.kind,
+                "path": str(path) if path else None,
+                "needs_epoch": product.needs_epoch,
+            }
+        )
+    return rows
+
+
 def _kernel_workspace_paths(fits_ws: Path, labels: PipelineLabels) -> dict[str, Any]:
     kernel_fit_dir = fits_ws / labels.kernel_fit_dir if labels.kernel_fit_dir else None
 
@@ -126,6 +194,15 @@ def _kernel_workspace_paths(fits_ws: Path, labels: PipelineLabels) -> dict[str, 
         "hotpants_stages": [
             {"diffs": s.diffs, "bkg": s.bkg, "convolved": s.convolved}
             for s in labels.hotpants_stages
+        ],
+        "epoch_products": [
+            {
+                "key": p.key,
+                "button_label": p.button_label,
+                "kind": p.kind,
+                "needs_epoch": p.needs_epoch,
+            }
+            for p in (labels.epoch_products or list_epoch_products(labels))
         ],
     }
 
@@ -540,6 +617,17 @@ def _build_epoch_table(
         sci_path = _resolve_sci_path(master_index, fits_ws, sci_basename, pid)
         template_path = template_cache.lookup(group_id, group_dx, group_dy)
 
+        products = _build_epoch_products(
+            labels,
+            master_index=master_index,
+            fits_ws=fits_ws,
+            product_id=pid,
+            sci_path=sci_path,
+            template_path=template_path,
+            conv_template_path=conv_template_path,
+            mask_path=mask_path,
+        )
+
         hotpants_ok = man.get(hotpants_ok_col)
         if pd.isna(hotpants_ok):
             hotpants_ok = None
@@ -567,6 +655,7 @@ def _build_epoch_table(
                 "regions_path": regions_path,
                 "mask_path": mask_path,
                 "hotpants_ok": hotpants_ok,
+                "products": products,
             }
         )
 

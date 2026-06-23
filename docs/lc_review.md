@@ -44,7 +44,15 @@ Set the default in `review.yaml` with `ds9_open_mode: xpa` (or `open`, `cli`).
 
 ### Sidebar buttons
 
-**Selected FFI** (per epoch): Diff, FFI, Template, Conv Template, Background, Mask.
+**Selected FFI** (per epoch): buttons are built from the workspace `diff_config.yaml` pipeline. Order is always:
+
+1. Primary diff (`forced_photometry.inputs.diffs`)
+2. FFI, Template
+3. Other `kernel_subtract` / `hotpants` outputs, last stage first (labels taken from each stage's `output` map; `write_bkg` / `write_convolved` respected)
+4. Conv Template (`convolved_templates.output`) when present
+5. Mask
+
+Example with both `kernel_subtract` (`ks_d`, `ks_b`) and `hotpants` (`mk_d`, `mk_b`): `mk_d`, FFI, Template, `mk_b`, `ks_d`, `ks_b`, Conv Template, Mask.
 
 **Kernel Determination** (when `kernel_fit/` exists): kernel reference (`kernel_fit/ffi.fits`), kernel template (`kernel_fit/template.fits`), static hp1/hp2 diff and bkg under `kernel_fit/`, `phot_bkg_fine_on_hp1_diff.fits`, `sci1_clean.fits`, mask. hp2 bkg is the 0th-order background.
 
